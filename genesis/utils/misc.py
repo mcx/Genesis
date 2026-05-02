@@ -413,7 +413,7 @@ TO_EXT_ARR_FAST_MAP = dict(
 
 
 def qd_to_python(
-    value: qd.Field | qd.Ndarray,
+    value: qd.Tensor | qd.Field | qd.Ndarray,
     transpose: bool = False,
     copy: bool | None = None,
     to_torch: bool = True,
@@ -427,6 +427,9 @@ def qd_to_python(
         without raising an exception if not.
         to_torch (bool): Whether to convert to Torch tensor or Numpy array. Defaults to True.
     """
+    if isinstance(value, qd.Tensor):
+        value = value._unwrap()
+
     # Get batch size if possible
     try:
         batch_shape = value.shape
@@ -618,7 +621,7 @@ def indices_to_mask(
 
 
 def qd_to_torch(
-    value: qd.Field | qd.Ndarray,
+    value: qd.Tensor | qd.Field | qd.Ndarray,
     row_mask: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None = None,
     col_mask: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None = None,
     keepdim: bool = True,
@@ -640,6 +643,8 @@ def qd_to_torch(
     # Try efficient shortcut first and only fallback to standard branching if necessary.
     # FIXME: Ideally one should detect if slicing would require a copy to avoid enforcing copy here.
     if gs.use_zerocopy:
+        if isinstance(value, qd.Tensor):
+            value = value._unwrap()
         try:
             tensor = value._T_tc if transpose else value._tc
             # FIXME: DLPack may return old values on Apple Metal if sync is not systematically called manually.
@@ -671,7 +676,7 @@ def qd_to_torch(
 
 
 def qd_to_numpy(
-    value: qd.Field | qd.Ndarray,
+    value: qd.Tensor | qd.Field | qd.Ndarray,
     row_mask: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None = None,
     col_mask: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None = None,
     keepdim: bool = True,
