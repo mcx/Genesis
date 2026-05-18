@@ -149,7 +149,7 @@ jobs:
                --no-container-mount-home \
                --container-workdir=/root/workspace"
           SLURM_ENV_VARS="NVIDIA_DRIVER_CAPABILITIES=all,BASH_ENV=/root/.bashrc,HF_TOKEN,GS_ENABLE_NDARRAY=${GS_ENABLE_NDARRAY}"
-          if [[ "${{ github.repository }}" == 'Genesis-Embodied-AI/Genesis' && "${{ github.ref }}" == 'refs/heads/main' ]] ; then
+          if [[ "${{ github.repository }}" == 'Genesis-Embodied-AI/genesis-world' && "${{ github.ref }}" == 'refs/heads/main' ]] ; then
             SLURM_ENV_VARS="${SLURM_ENV_VARS},WANDB_API_KEY"
           fi
 
@@ -183,7 +183,7 @@ jobs:
                    --print -m "benchmarks" ./tests
 
             cat speed_test*.txt > "/mnt/data/artifacts/speed_test_${SLURM_JOB_NAME}.txt"
-            if [ -n "${WANDB_API_KEY}" ] ; then (
+            if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ] ; then (
               ls -lh /mnt/data/artifacts/*.txt
               python tests/upload_benchmarks_table_to_wandb.py \
                   --in-file "/mnt/data/artifacts/mem_test_${SLURM_JOB_NAME}.txt" \
@@ -196,7 +196,7 @@ jobs:
                   --metrics compile_time runtime_fps realtime_factor \
                   --run-prefix speed
             ) else (
-              echo "No wandb key => skipping wandb uploads"
+              echo "Not on main branch => skipping wandb uploads"
             ) fi
           EOF
       - name: Kill Slurm job
