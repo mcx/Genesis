@@ -1960,6 +1960,7 @@ def _cholesky_and_solve_fused_tiled_impl(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
     TileCls: qd.template(),
+    write_L_to_nt_H: qd.template() = False,
 ):
     """Fused Cholesky factorization and triangular solve, keeping L in shared memory.
 
@@ -1969,6 +1970,10 @@ def _cholesky_and_solve_fused_tiled_impl(
 
     Tile size T and TileCls are dispatched by the func_cholesky_and_solve_fused_tiled wrapper; see
     _cholesky_factor_direct_tiled_impl for the rule.
+
+    When ``write_L_to_nt_H`` is True, L is also written back to ``constraint_state.nt_H`` at the end of the kernel.
+    This is required by the warm-start dispatch (``enable_fused_factor_solve_init``) so the monolith body's incremental
+    rank-1 Cholesky update finds L (not H) in nt_H.
     """
     T = qd.static(static_rigid_sim_config.cholesky_tile_size)
     LOG2_T = qd.static(T.bit_length() - 1)
@@ -2083,6 +2088,20 @@ def _cholesky_and_solve_fused_tiled_impl(
             constraint_state.Mgrad[k, i_b] = v_sh[k]
             k = k + T
 
+        # When dispatched from the warm-start in func_solve_init, the monolith body's first iter expects nt_H to hold L
+        # (it runs an incremental rank-1 Cholesky update on it). The fused kernel keeps L only in shmem, so restore the
+        # post-condition with a tid-strided writeback over the full n_dofs * n_dofs grid. The wasted upper-triangle
+        # writes are harmless (no nt_H reader touches them) and avoid a per-element predicate that would idle half the
+        # warp on small rows.
+        if qd.static(write_L_to_nt_H):
+            i_flat = tid
+            n_dofs_sq = n_dofs * n_dofs
+            while i_flat < n_dofs_sq:
+                i_d1 = i_flat // n_dofs
+                i_d2 = i_flat % n_dofs
+                constraint_state.nt_H[i_b, i_d1, i_d2] = L_sh[i_d1, i_d2]
+                i_flat = i_flat + T
+
 
 @qd.func
 def func_cholesky_factor_direct_tiled(
@@ -2106,15 +2125,16 @@ def func_cholesky_and_solve_fused_tiled(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
+    write_L_to_nt_H: qd.template() = False,
 ):
     """Tile-size dispatcher; see _cholesky_and_solve_fused_tiled_impl for the algorithm and dispatch rule."""
     if qd.static(static_rigid_sim_config.cholesky_tile_size == 32):
         _cholesky_and_solve_fused_tiled_impl(
-            constraint_state, rigid_global_info, static_rigid_sim_config, Tile32x32Cholesky
+            constraint_state, rigid_global_info, static_rigid_sim_config, Tile32x32Cholesky, write_L_to_nt_H
         )
     else:
         _cholesky_and_solve_fused_tiled_impl(
-            constraint_state, rigid_global_info, static_rigid_sim_config, Tile16x16Cholesky
+            constraint_state, rigid_global_info, static_rigid_sim_config, Tile16x16Cholesky, write_L_to_nt_H
         )
 
 
@@ -2169,7 +2189,10 @@ def func_hessian_and_cholesky_factor_direct(
         func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
-            func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)
+            # When the fused warm-start dispatch is on, the factor is folded into the fused kernel (called from
+            # ``func_update_gradient_tiled`` below); skipping the standalone factor here avoids doing the work twice.
+            if qd.static(not static_rigid_sim_config.enable_fused_factor_solve_init):
+                func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)
         else:
             qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
             for i_b in range(_B):
@@ -3328,20 +3351,41 @@ def _func_update_qfrc_constraint_coop(
     """Compute qfrc_constraint = J^T @ efc_force using one cooperating warp per env.
 
     32 lanes stride i_c so adjacent reads of jac[i_c, i_d, i_b] and efc_force[i_c, i_b] are stride-1 under the flipped
-    jac and Tier-1 flipped efc_force layouts. Outer loop is over i_d; each i_d does one warp-reduce.
+    jac and flipped efc_force layouts. Outer loop is over i_d; each i_d does one warp-reduce.
+
+    ``efc_force[i_c, i_b]`` is invariant across the inner ``i_d`` loop, so we hoist a small per-lane register window
+    of it before the ``i_d`` loop and reuse those values across all dofs, dropping ``n_dofs - 1`` global re-reads per
+    cached constraint. ``MAX_CACHE_PER_LANE = 2`` covers ``n_con <= 64`` fully; larger ``n_con`` falls back to the
+    global re-read on the tail (same code path as before). Tuned against the Tile32x32 Cholesky register budget.
     """
     n_dofs = constraint_state.qfrc_constraint.shape[0]
     _B = constraint_state.grad.shape[1]
     _K = qd.static(32)
+    MAX_CACHE_PER_LANE = qd.static(2)
 
     qd.loop_config(name="update_constraint_qfrc", block_dim=_K)
     for i_flat in range(_B * _K):
         tid = i_flat % _K
         i_b = i_flat // _K
         n_con = constraint_state.n_constraints[i_b]
+
+        # Phase 1: load up to MAX_CACHE_PER_LANE of this lane's efc_force entries into registers. Coalesced under
+        # the flipped efc_force layout (stride-1 over i_c for fixed i_b across warp lanes).
+        efc_local = qd.Vector([0.0] * MAX_CACHE_PER_LANE, dt=gs.qd_float)
+        for k in range(MAX_CACHE_PER_LANE):
+            i_c_k = tid + k * _K
+            if i_c_k < n_con:
+                efc_local[k] = constraint_state.efc_force[i_c_k, i_b]
+
+        # Phase 2: i_d loop reads jac fresh (varies per i_d) but reuses cached ``efc_local`` for the head. The tail
+        # re-reads efc_force from global (only triggered when ``n_con > MAX_CACHE_PER_LANE * _K``).
         for i_d in range(n_dofs):
             qfrc_lane = gs.qd_float(0.0)
-            i_c = tid
+            for k in range(MAX_CACHE_PER_LANE):
+                i_c_k = tid + k * _K
+                if i_c_k < n_con:
+                    qfrc_lane = qfrc_lane + constraint_state.jac[i_c_k, i_d, i_b] * efc_local[k]
+            i_c = tid + MAX_CACHE_PER_LANE * _K
             while i_c < n_con:
                 qfrc_lane = qfrc_lane + constraint_state.jac[i_c, i_d, i_b] * constraint_state.efc_force[i_c, i_b]
                 i_c = i_c + _K
@@ -3533,7 +3577,15 @@ def func_update_gradient_tiled(
             )
 
     if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-        func_cholesky_solve_tiled(constraint_state, static_rigid_sim_config)
+        # Warm-start path: dispatch through the fused factor+solve kernel so L stays in shared memory between factor
+        # and solve. ``write_L_to_nt_H=True`` also writes L back to ``nt_H``, which the monolith body's first iter
+        # needs for its incremental rank-1 Cholesky update.
+        if qd.static(static_rigid_sim_config.enable_fused_factor_solve_init):
+            func_cholesky_and_solve_fused_tiled(
+                constraint_state, rigid_global_info, static_rigid_sim_config, write_L_to_nt_H=True
+            )
+        else:
+            func_cholesky_solve_tiled(constraint_state, static_rigid_sim_config)
 
 
 @qd.func
