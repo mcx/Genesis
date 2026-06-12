@@ -1157,10 +1157,18 @@ class RigidSolver(KinematicSolver):
         if not self._disable_constraint:
             if self._use_contact_island:
                 self.constraint_solver.add_constraints()
+                self.constraint_solver.resolve(
+                    self.entities_state,
+                    self.entities_info,
+                    self.dofs_state,
+                    self.links_state,
+                    self.geoms_state,
+                    self._rigid_global_info,
+                    self.constraint_solver.contact_island.contact_island_state,
+                )
             else:
                 self.constraint_solver.add_inequality_constraints()
-
-            self.constraint_solver.resolve(self.entities_info, self._rigid_global_info)
+                self.constraint_solver.resolve(self.entities_info, self._rigid_global_info)
 
     def _func_forward_dynamics(self):
         kernel_forward_dynamics(
@@ -1774,8 +1782,9 @@ class RigidSolver(KinematicSolver):
             links_idx = self._base_links_idx
 
         # Zero-copy fast path: single base link, non-relative. Write the position buffer in place instead of
-        # launching a kernel. The kernel path below handles relative or multi-link updates.
-        if gs.use_zerocopy and not relative and isinstance(links_idx, int):
+        # launching a kernel. The kernel path below handles relative or multi-link updates, as well as waking up
+        # hibernated entities, which is required whenever hibernation is enabled.
+        if gs.use_zerocopy and not relative and isinstance(links_idx, int) and not self._use_hibernation:
             link = self.links[links_idx]
             if link.is_fixed:
                 data = qd_to_torch(self.links_state.pos, transpose=True, copy=False)
@@ -1832,7 +1841,7 @@ class RigidSolver(KinematicSolver):
                 )
 
             # Wake up hibernated entities before setting position (fixed links don't need wake-up)
-            if self._options.use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
+            if self._use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
                 kernel_wake_up_entities_by_links(
                     links_idx,
                     envs_idx,
@@ -1843,6 +1852,7 @@ class RigidSolver(KinematicSolver):
                     dofs_state=self.dofs_state,
                     geoms_state=self.geoms_state,
                     rigid_global_info=self._rigid_global_info,
+                    contact_island_state=self.constraint_solver.contact_island.contact_island_state,
                     static_rigid_sim_config=self._static_rigid_sim_config,
                 )
 
@@ -1893,8 +1903,9 @@ class RigidSolver(KinematicSolver):
             links_idx = self._base_links_idx
 
         # Zero-copy fast path: single base link, non-relative. Write the quaternion buffer in place instead of
-        # launching a kernel. The kernel path below handles relative or multi-link updates.
-        if gs.use_zerocopy and not relative and isinstance(links_idx, int):
+        # launching a kernel. The kernel path below handles relative or multi-link updates, as well as waking up
+        # hibernated entities, which is required whenever hibernation is enabled.
+        if gs.use_zerocopy and not relative and isinstance(links_idx, int) and not self._use_hibernation:
             link = self.links[links_idx]
             if link.is_fixed:
                 data = qd_to_torch(self.links_state.quat, transpose=True, copy=False)
@@ -1945,7 +1956,7 @@ class RigidSolver(KinematicSolver):
                 gs.raise_exception("Impossible to set env-specific quat for fixed links with at least one geometry.")
 
             # Wake up hibernated entities before setting quaternion (fixed links don't need wake-up)
-            if self._options.use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
+            if self._use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
                 kernel_wake_up_entities_by_links(
                     links_idx,
                     envs_idx,
@@ -1956,6 +1967,7 @@ class RigidSolver(KinematicSolver):
                     dofs_state=self.dofs_state,
                     geoms_state=self.geoms_state,
                     rigid_global_info=self._rigid_global_info,
+                    contact_island_state=self.constraint_solver.contact_island.contact_island_state,
                     static_rigid_sim_config=self._static_rigid_sim_config,
                 )
 
