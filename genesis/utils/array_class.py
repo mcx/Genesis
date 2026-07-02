@@ -384,6 +384,18 @@ def get_constraint_state(constraint_solver, solver):
     # striding i_d in cooperative kernels become stride-1; the regression on 1T-per-(i_d, i_b) writers is patched on
     # a per-consumer basis under the same enable_cooperative_constraint_kernels flag.
     dof_vec_layout = (1, 0) if batch_first else None
+    # Rank-1 working vectors of the incremental Cholesky update, flattened slot-minor as [i_d * n_slots + i_u]: one
+    # slot per fused update on the CPU per-island path (func_rank_batch_update_island), a single slot elsewhere
+    # (indexing then reduces to [i_d]). Flat 2D so the buffer keeps the DOF-vec rank and layout on every backend.
+    nt_vec_n_slots = (
+        solver._static_rigid_sim_config.hessian_rank_update_batch
+        if (
+            constraint_solver.sparse_solve
+            and solver._static_rigid_sim_config.enable_per_island_solve
+            and not solver._static_rigid_sim_config.sparse_envelope
+        )
+        else 1
+    )
 
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
     # The decomposed (parallel) noslip build computes MinvJT and efc_AR/efc_b for all envs before the force-update
@@ -447,7 +459,7 @@ def get_constraint_state(constraint_solver, solver):
         mv=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         cg_prev_grad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         cg_prev_Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
-        nt_vec=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        nt_vec=V(dtype=gs.qd_float, shape=(solver.n_dofs_ * nt_vec_n_slots, _B), layout=dof_vec_layout),
         # When the register-tiled mass factor is on, reuse its scratch (rigid_global_info.mass_mat_tiled_scratch,
         # allocated with this exact shape) as the Hessian buffer rather than allocating a second one: the factor only
         # writes it before the constraint solve repopulates it in the same step.
@@ -671,6 +683,9 @@ class IslandState:
     # island (e.g. a tall stack of bodies coupled into one island) factors with its band instead of densely. Defaults
     # to 0 (dense) when uncomputed, so any path that does not fill it stays correct.
     dof_env_start_local: qd.Tensor
+    # Envelope transpose: largest local row whose envelope reaches column ld, bounding the column-oriented factor and
+    # solve sweeps to the band. No safe uncomputed default (0 truncates): only the CPU per-island path may read it.
+    dof_env_col_end: qd.Tensor
     contact_slices: IslandSlices
     contact_id: qd.Tensor
     constraint_slices: IslandSlices
@@ -725,6 +740,7 @@ def get_island_state(solver, collider):
         dof_local_pos=V(dtype=gs.qd_int, shape=maybe_shape((n_dofs, _B), is_active)),
         dofs_island_idx=V(dtype=gs.qd_int, shape=maybe_shape((n_dofs, _B), is_active)),
         dof_env_start_local=V(dtype=gs.qd_int, shape=maybe_shape((n_dofs, _B), is_active)),
+        dof_env_col_end=V(dtype=gs.qd_int, shape=maybe_shape((n_dofs, _B), is_active)),
         contact_slices=get_slices(solver, is_active),
         contact_id=V(dtype=gs.qd_int, shape=maybe_shape((max_candidate_contacts, _B), is_active)),
         constraint_slices=get_slices(solver, is_active),
@@ -1679,10 +1695,11 @@ class LinksState:
 
 
 def get_links_state(solver):
-    max_n_joints_per_link = solver._static_rigid_sim_config.max_n_joints_per_link
     shape = (solver.n_links_, solver._B)
     requires_grad = solver._requires_grad
-    shape_bw = (solver.n_links_, max(max_n_joints_per_link + 1, 1), solver._B)
+    # The backward joint buffers hold one slot per joint of a link plus the link itself; collapsed when grad is off.
+    n_joints_bw = (max(link.n_joints for link in solver.links) + 1) if requires_grad and solver.n_links else 1
+    shape_bw = (solver.n_links_, n_joints_bw, solver._B)
 
     return LinksState(
         cinr_inertial=V(dtype=gs.qd_mat3, shape=shape, needs_grad=requires_grad),
@@ -2239,7 +2256,6 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     batch_links_info: bool
     batch_dofs_info: bool
     batch_joints_info: bool
-    enable_heterogeneous: bool
     enable_mujoco_compatibility: bool
     enable_multi_contact: bool
     enable_joint_limit: bool
@@ -2267,6 +2283,9 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # based on n_dofs: 32 wins for large problems (e.g. dex_hand, n_dofs=62); 16 wins when n_dofs is small or lands in a
     # padding-unfavorable band (e.g. g1_fall, n_dofs=35).
     cholesky_tile_size: int = 32
+    # Number of rank-1 Cholesky updates fused into one column sweep by the CPU per-island incremental factor
+    # (func_rank_batch_update_island). Sizes the nt_vec slots and the static per-column unroll.
+    hessian_rank_update_batch: int = 8
     # Register-streaming tiled per-entity mass factor for the >shared-cap branch of func_factor_mass (GPU forward
     # only). When True, each entity's single-mass-block submatrix factors in registers via the same TileNxN Cholesky
     # primitive as the Hessian, instead of the shared-pivot cooperative LDL^T. Only enabled when every entity is a
@@ -2306,12 +2325,6 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # instead of serializing them inside one block-per-env. Sized to saturate the GPU (gpu_cores // tile_size) but no
     # larger than the worst-case work-list (n_links * n_envs), so tiny problems do not launch idle blocks.
     island_factor_n_blocks: int = 1
-    max_n_links_per_entity: int = -1
-    max_n_joints_per_link: int = -1
-    max_n_dofs_per_joint: int = -1
-    max_n_qs_per_link: int = -1
-    max_n_dofs_per_entity: int = -1
-    max_n_dofs_per_link: int = -1
     max_n_geoms_per_entity: int = -1
     n_entities: int = -1
     n_links: int = -1
