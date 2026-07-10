@@ -487,14 +487,15 @@ class RigidSolver(KinematicSolver):
         # The subgroup-cooperative constraint kernels (and the batch-first layout they expect) win when per-env compute
         # density amortizes the warp-per-env overhead, and lose when envs are sparse and many (the 1-thread-per-env path
         # is already coalesced under (len_constraints_, _B)). They are also the layout the decomposed solve arm requires.
-        # Empirically the cooperative path wins around 4096 envs at n_dofs >= ~18 and washes out by ~30000 envs at
-        # n_dofs <= ~12; the n_envs <= 8192 and n_dofs >= 16 thresholds bound that crossover. Sparse solve is excluded
-        # (the cooperative qfrc kernel and the flipped-layout jac readers are dense-only).
+        # Empirically the cooperative path wins from ~4096 envs at n_dofs >= ~18 and loses once the env dimension alone
+        # saturates the GPU, so the env bound is get_gpu_core_count() (the threshold envs_undersaturate uses below), not
+        # a fixed literal, combined with n_dofs >= 16. Sparse solve is excluded (the cooperative qfrc kernel and the
+        # flipped-layout jac readers are dense-only).
         enable_cooperative_constraint_kernels = (
             gs.backend != gs.cpu
             and not self.sim.options.requires_grad
             and not sparse_solve
-            and self._sim._B <= 8192
+            and self._sim._B <= get_gpu_core_count()
             and self.n_dofs >= 16
         )
         constraint_layout_batch_first = (
