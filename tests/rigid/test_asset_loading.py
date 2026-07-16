@@ -58,6 +58,30 @@ def test_mjcf_parsing_with_include():
     assert_allclose(robot1.get_qpos(), robot3.get_qpos(), tol=gs.EPS)
 
 
+@pytest.mark.required
+def test_ground_plane_preservation(box_plan):
+    mjcf = ET.tostring(box_plan, encoding="unicode")
+
+    scene = gs.Scene()
+    entity_with_ground = scene.add_entity(
+        gs.morphs.MJCF(
+            file=mjcf,
+            exclude_ground_plane=False,
+        )
+    )
+    entity_without_ground = scene.add_entity(
+        gs.morphs.MJCF(
+            file=mjcf,
+            exclude_ground_plane=True,
+        )
+    )
+    scene.build()
+
+    assert_equal(sum(geom.type == gs.GEOM_TYPE.PLANE for geom in entity_with_ground.geoms), 1)
+    assert_equal(sum(geom.type == gs.GEOM_TYPE.PLANE for geom in entity_without_ground.geoms), 0)
+    assert_equal(sum(geom.type == gs.GEOM_TYPE.BOX for geom in entity_without_ground.geoms), 1)
+
+
 @pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_urdf_parsing(show_viewer, tol):
