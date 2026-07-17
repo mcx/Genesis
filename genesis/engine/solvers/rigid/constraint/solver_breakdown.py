@@ -7,14 +7,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 from . import solver
 
-# --- Parallel linesearch constants ---
-# Number of candidate step sizes evaluated simultaneously per env.
-# Each CUDA block processes one env with K threads, using shared memory for the argmin reduction.
-# Similar to BLOCK_DIM in func_hessian_direct_tiled: determines parallelism and shared memory layout.
-LS_PARALLEL_K = 32
-
-# Block sizes for shared-memory reductions in _kernel_parallel_linesearch_p0 and _jv.
-_P0_BLOCK = 32
+# Shared-memory reduction block size for the _jv path.
 _JV_BLOCK = 32
 
 # Maximum allowed alpha (prevents divergence from degenerate steps).
@@ -111,8 +104,10 @@ def _func_decomp_linesearch_p0(
     Post-linesearch: Separate kernels for constraint force update, cost update, gradient update, Hessian update (Newton
     only), and search direction update. These reuse the batch-level functions from solver.py.
     """
+    # Block size for shared-memory reductions.
+    _T = qd.static(32)
+
     _B = constraint_state.grad.shape[1]
-    _T = qd.static(_P0_BLOCK)
 
     qd.loop_config(name="parallel_linesearch_p0", block_dim=_T)
     for i_flat in range(_B * _T):
@@ -466,8 +461,12 @@ def _func_decomp_linesearch_refine_and_apply(
     fixed env). The qd.Tensor layout rewrite makes the canonical indexing identical in both paths; only the access
     pattern changes.
     """
+    # Number of candidate step sizes evaluated simultaneously per env.
+    # Each CUDA block processes one env with K threads, using shared memory for the argmin reduction.
+    # Similar to BLOCK_DIM in func_hessian_direct_tiled: determines parallelism and shared memory layout.
+    _K = qd.static(32)
+
     _B = constraint_state.grad.shape[1]
-    _K = qd.static(LS_PARALLEL_K)
 
     qd.loop_config(name="parallel_linesearch_eval", block_dim=_K)
     for i_flat in range(_B * _K):
