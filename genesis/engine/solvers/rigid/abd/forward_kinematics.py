@@ -174,7 +174,9 @@ def func_COM_links_entity(
 
         i_r = dyn_info.links.root_idx[I_l]
         dyn_state.links.mass_sum[i_r, i_b] = dyn_state.links.mass_sum[i_r, i_b] + mass
-        qd.atomic_add(dyn_state.links.root_COM_bw[i_r, i_b], mass * dyn_state.links.i_pos_bw[i_l, i_b])
+        dyn_state.links.root_COM_bw[i_r, i_b] = (
+            dyn_state.links.root_COM_bw[i_r, i_b] + mass * dyn_state.links.i_pos_bw[i_l, i_b]
+        )
 
     for i_l in range(dyn_info.entities.link_start[i_e], dyn_info.entities.link_end[i_e]):
         if qd.static(rigid_config.use_hibernation):
