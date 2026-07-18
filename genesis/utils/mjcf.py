@@ -104,7 +104,11 @@ def build_model(
             for elem in tuple(xml_root.findall("include")):
                 include_path = parent_path / elem.attrib["file"]
                 include_root = ET.parse(Path(asset_path) / include_path).getroot()
-                for include_elem in include_root.findall(".//mesh"):
+                # Mesh file paths in the included file are relative to that file's directory, whereas meshdir
+                # points at the top-level model, so rewrite them to stay valid once inlined. Only <asset> meshes
+                # reference a file; a <mesh> under <default> is a default class setting attributes (e.g.
+                # maxhullvert) and a vertex mesh under <asset> is procedural, both carrying no file to rewrite.
+                for include_elem in include_root.findall(".//asset/mesh[@file]"):
                     include_elem.attrib["file"] = str(include_path.parent / include_elem.attrib["file"])
                 for child in include_root:
                     mjcf.append(child)
