@@ -523,6 +523,7 @@ def _kernel_build_sensor_candidate_geom_mask(
 
 @qd.func
 def _func_query_contact_depth_penetration_bvh(
+    i_t: int,
     i_b: int,
     i_s: int,
     probe_pos: qd.types.vector(3),
@@ -557,14 +558,14 @@ def _func_query_contact_depth_penetration_bvh(
     while stack_idx > 0:
         stack_idx -= 1
         node_idx = node_stack[stack_idx]
-        node = bvh_nodes[i_b, node_idx]
+        node = bvh_nodes[i_t, node_idx]
 
         if not func_sphere_intersects_aabb(probe_pos, best_dist_sq, node.bound.min, node.bound.max):
             continue
 
         if node.left == -1:
             sorted_leaf_idx = node_idx - (n_triangles - 1)
-            i_f = qd.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], gs.qd_int)
+            i_f = qd.cast(bvh_morton_codes[i_t, sorted_leaf_idx][1], gs.qd_int)
             i_g = dyn_info.faces.geom_idx[i_f]
             if not sensor_candidate_geom_mask[i_b, i_s, i_g]:
                 continue
@@ -596,6 +597,7 @@ def _func_query_contact_depth_penetration_bvh(
 
 @qd.func
 def _func_query_contact_depth_bvh(
+    i_t: int,
     i_b: int,
     i_s: int,
     probe_pos: qd.types.vector(3),
@@ -630,14 +632,14 @@ def _func_query_contact_depth_bvh(
     while stack_idx > 0:
         stack_idx -= 1
         node_idx = node_stack[stack_idx]
-        node = bvh_nodes[i_b, node_idx]
+        node = bvh_nodes[i_t, node_idx]
 
         if not func_sphere_intersects_aabb(probe_pos, best_dist_sq, node.bound.min, node.bound.max):
             continue
 
         if node.left == -1:
             sorted_leaf_idx = node_idx - (n_triangles - 1)
-            i_f = qd.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], gs.qd_int)
+            i_f = qd.cast(bvh_morton_codes[i_t, sorted_leaf_idx][1], gs.qd_int)
             i_g = dyn_info.faces.geom_idx[i_f]
             if not sensor_candidate_geom_mask[i_b, i_s, i_g]:
                 continue
@@ -678,6 +680,8 @@ def _func_query_contact_depth_bvh(
 def _kernel_contact_depth_probe_bvh(
     probe_sensor_idx: qd.types.ndarray(),
     links_idx: qd.types.ndarray(),
+    env_bvh_idx_a: qd.types.ndarray(),
+    env_bvh_idx_b: qd.types.ndarray(),
     sensor_cache_start: qd.types.ndarray(),
     sensor_probe_start: qd.types.ndarray(),
     probe_positions_local: qd.types.ndarray(),
@@ -724,6 +728,7 @@ def _kernel_contact_depth_probe_bvh(
         )
 
         max_penetration_gt, max_penetration_m, signed_dist = _func_query_contact_depth_penetration_bvh(
+            env_bvh_idx_a[i_b],
             i_b,
             i_s,
             probe_pos,
@@ -741,6 +746,7 @@ def _kernel_contact_depth_probe_bvh(
             # triangle out-penetrates a nearer outside one - so the globally nearest answer is the one with the
             # smaller signed-distance magnitude, taken wholesale.
             max_penetration_gt_b, max_penetration_m_b, signed_dist_b = _func_query_contact_depth_penetration_bvh(
+                env_bvh_idx_b[i_b],
                 i_b,
                 i_s,
                 probe_pos,
@@ -765,6 +771,8 @@ def _kernel_contact_depth_probe_bvh(
 def _kernel_kinematic_taxel_bvh(
     probe_sensor_idx: qd.types.ndarray(),
     links_idx: qd.types.ndarray(),
+    env_bvh_idx_a: qd.types.ndarray(),
+    env_bvh_idx_b: qd.types.ndarray(),
     sensor_cache_start: qd.types.ndarray(),
     sensor_probe_start: qd.types.ndarray(),
     probe_positions_local: qd.types.ndarray(),
@@ -834,6 +842,7 @@ def _kernel_kinematic_taxel_bvh(
             contact_normal_m,
             signed_dist,
         ) = _func_query_contact_depth_bvh(
+            env_bvh_idx_a[i_b],
             i_b,
             i_s,
             probe_pos,
@@ -857,6 +866,7 @@ def _kernel_kinematic_taxel_bvh(
                 contact_normal_m_b,
                 signed_dist_b,
             ) = _func_query_contact_depth_bvh(
+                env_bvh_idx_b[i_b],
                 i_b,
                 i_s,
                 probe_pos,
@@ -1035,6 +1045,8 @@ class ContactDepthProbeSensor(
             _kernel_contact_depth_probe_bvh(
                 shared_metadata.probe_sensor_idx,
                 shared_metadata.links_idx,
+                entry_a.env_bvh_idx,
+                entry_b.env_bvh_idx,
                 shared_metadata.sensor_cache_start,
                 shared_metadata.sensor_probe_start,
                 shared_metadata.probe_positions,
@@ -1313,6 +1325,8 @@ class KinematicTaxelSensor(
             _kernel_kinematic_taxel_bvh(
                 shared_metadata.probe_sensor_idx,
                 shared_metadata.links_idx,
+                entry_a.env_bvh_idx,
+                entry_b.env_bvh_idx,
                 shared_metadata.sensor_cache_start,
                 shared_metadata.sensor_probe_start,
                 shared_metadata.probe_positions,
