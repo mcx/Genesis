@@ -92,13 +92,17 @@ def test_contact_per_step_force_grad_matches_fd(shape, grad_capsule, precision, 
     # only guards the degenerate-FD case.
     fd_rtol = 1e-6 if precision == "64" else 2e-3
     fd_atol = 1e-14 if precision == "64" else 1e-6
-    base_force = np.array([0.0, 0.0, -8.0, 0.0, 0.0, 0.0])
+    # The small tangential preload keeps the contact manifold away from a gain / loss transition, which the
+    # tangential finite-difference perturbation would otherwise cross (the in-test contact-count guard trips).
+    base_force = np.array([0.5, 0.0, -8.0, 0.0, 0.0, 0.0])
     init_force = np.broadcast_to(base_force, (n_steps, 6)).copy()
 
     def settle(scene, obj):
+        # Settling under the same base force as the grad window keeps the contact manifold in its loaded
+        # configuration throughout, so the in-window contact-count guards hold.
         obj.set_dofs_position(gs.tensor(rest_dofs, dtype=gs.tc_float).sceneless())
         for _ in range(n_settle):
-            obj.control_dofs_force(0.0)
+            obj.control_dofs_force(base_force)
             scene.step()
 
     scene_ana, obj_ana = _build_contact_scene(shape, grad_capsule, requires_grad=True, show_viewer=show_viewer)
@@ -124,18 +128,23 @@ def test_contact_per_step_force_grad_matches_fd(shape, grad_capsule, precision, 
         scene_fd.reset()
         settle(scene_fd, obj_fd)
         for t in range(n_steps):
-            obj_fd.control_dofs_force(gs.tensor(perturbed[t], dtype=gs.tc_float))
+            obj_fd.control_dofs_force(perturbed[t])
             scene_fd.step()
             assert _n_contacts(scene_fd) == nc, "contact set changed under FD perturbation"
         return float((scene_fd.rigid_solver.get_state().qpos[0, :3] ** 2).sum().detach())
 
+    # Both the normal (z) and a tangential (x) force component: the tangential adjoint flows through the friction
+    # rows and their contact-frame chains, which the normal component alone leaves untested.
     for t in range(n_steps):
-        plus = init_force.copy()
-        plus[t, 2] += eps
-        minus = init_force.copy()
-        minus[t, 2] -= eps
-        fd_z = (loss_at(plus) - loss_at(minus)) / (2 * eps)
-        assert_allclose(ana[t, 2], fd_z, rtol=fd_rtol, atol=fd_atol, err_msg=f"contact force.grad mismatch at t={t}")
+        for i_d in (2, 0):
+            plus = init_force.copy()
+            plus[t, i_d] += eps
+            minus = init_force.copy()
+            minus[t, i_d] -= eps
+            fd = (loss_at(plus) - loss_at(minus)) / (2 * eps)
+            assert_allclose(
+                ana[t, i_d], fd, rtol=fd_rtol, atol=fd_atol, err_msg=f"contact force.grad mismatch at t={t} dof={i_d}"
+            )
 
 
 @pytest.mark.required
@@ -341,7 +350,9 @@ def test_constraint_solver_backward_matches_fd(monkeypatch):
     from genesis.engine.solvers.rigid.constraint.solver import func_solve_body, func_solve_init
     from genesis.engine.solvers.rigid.rigid_solver import kernel_step_1
 
-    # fp64 is required: the FD perturbation must be small enough for a reliable estimate, which fp32 cannot resolve
+    # fp64 is required: the parameter-side inputs (aref, efc_D, jac, mass) move the loss by far less than its own
+    # fp32 resolution at any usable step size, so their finite-difference deltas drown at fp32
+
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             requires_grad=True,
@@ -413,7 +424,9 @@ def test_constraint_solver_backward_matches_fd(monkeypatch):
         updated_acc_smooth = np.linalg.solve(input_mass[..., 0], input_force[..., 0])
         rigid_solver.dyn_state.dofs.acc_smooth.from_numpy(updated_acc_smooth[..., None])
         constraint_solver.resolve()
-        return ((qd_to_torch(constraint_solver.qacc) - target_qacc) ** 2).mean()
+        # Collapse to a Python scalar right away: the reduction reads a zero-copy view of qacc, and a deferred
+        # evaluation (MPS is lazy) would otherwise run only after the next call overwrites the buffer in place.
+        return float(((qd_to_torch(constraint_solver.qacc) - target_qacc) ** 2).mean())
 
     init_input_mass = qd_to_numpy(rigid_solver.rigid_info.mass_mat, copy=True)
     init_input_jac = qd_to_numpy(constraint_solver.constraint_state.jac, copy=True)
@@ -475,5 +488,5 @@ def test_constraint_solver_backward_matches_fd(monkeypatch):
             loss_p = compute_loss(**{**inputs, key: init_x + rand_dx * fd_eps})
             loss_m = compute_loss(**{**inputs, key: init_x - rand_dx * fd_eps})
             dL_fd = (loss_p - loss_m) / (2 * fd_eps)
-            error += (dL - dL_fd).abs() / max(abs(dL), abs(dL_fd), gs.EPS)
+            error += abs(dL - dL_fd) / max(abs(dL), abs(dL_fd), gs.EPS)
         assert_allclose(error / trials, 0.0, atol=1e-4)
