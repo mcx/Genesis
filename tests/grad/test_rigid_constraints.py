@@ -1,5 +1,3 @@
-# FD-vs-analytical reverse-mode gradient checks through the rigid constraint solver: joint limits, dof frictionloss,
-# and the three equality types (joint / connect / weld), plus an all-groups integration scene.
 import math
 
 import numpy as np
@@ -14,7 +12,7 @@ from .utils import assert_grad_matches_fd, make_diff_scene_pair
 
 @pytest.mark.required
 @pytest.mark.debug(False)
-def test_rigid_joint_limit_grad_matches_fd(grad_slider_limit, precision, show_viewer):
+def test_joint_limit_grad_matches_fd(grad_slider_limit, precision, show_viewer):
     # Forward: the slider limit must actually bound the cart (it drifts freely when the constraint is off).
     off = make_diff_scene_pair(
         grad_slider_limit,
@@ -23,6 +21,7 @@ def test_rigid_joint_limit_grad_matches_fd(grad_slider_limit, precision, show_vi
         gravity=(0.0, 0.0, 0.0),
         enable_joint_limit=False,
         disable_constraint=True,
+        modes=(False,),
     )
     off.scene_fd.reset()
     off.entity_fd.set_dofs_velocity(gs.tensor([100.0], dtype=gs.tc_float))
@@ -86,6 +85,7 @@ def test_rigid_joint_limit_grad_matches_fd(grad_slider_limit, precision, show_vi
         gravity=(0.0, 0.0, 0.0),
         enable_joint_limit=False,
         disable_constraint=False,
+        modes=(True,),
     )
     grads = {}
     for pair, key in ((off_solver, "off"), (on, "on")):
@@ -107,18 +107,15 @@ def test_rigid_joint_limit_grad_matches_fd(grad_slider_limit, precision, show_vi
 @pytest.mark.required
 @pytest.mark.parametrize("model_name", ["grad_slider_limit", "grad_cartpole", "grad_hopper"])
 @pytest.mark.debug(False)
-def test_rigid_per_step_force_grad_matches_fd(model_name, request, precision, show_viewer):
+def test_per_step_force_into_limit_grad_matches_fd(model_name, request, precision, show_viewer):
     # Per-step control-force adjoint driving a joint into its limit, across three topologies. A constant force over
     # the horizon pushes the tracked dof into the active band; the setup-sanity assert guards against a vacuous run.
-    hopper_force = np.zeros(6)
-    hopper_force[5] = 200.0
     # (gravity, n_steps, per-step force, loss reads links_pos, sanity dof, sanity threshold, initial dof pose,
-    # fp32 tolerance). The fp32 floor depends on the topology: the slider limit is the noisiest, the hopper the
-    # cleanest; fp64 clears 5e-5 for all three (the cartpole limit kink sets that floor).
+    # fp32 tolerance).
     gravity, n_steps, per_step_force, is_links_loss, sanity_dof, sanity_thresh, init_pos, fp32_tol = {
-        "grad_slider_limit": ((0.0, 0.0, 0.0), 10, [500.0], False, 0, 3.5, None, 1e-3),
-        "grad_cartpole": ((0.0, 0.0, -9.81), 15, [2000.0, 0.0], False, 0, 3.5, [0.0, -math.pi], 5e-4),
-        "grad_hopper": ((0.0, 0.0, 0.0), 10, hopper_force, True, 5, 0.7, None, 2e-4),
+        "grad_slider_limit": ((0.0, 0.0, 0.0), 10, [500.0], False, 0, 3.5, None, 1e-4),
+        "grad_cartpole": ((0.0, 0.0, -9.81), 15, [2000.0, 0.0], False, 0, 3.5, [0.0, -math.pi], 2e-4),
+        "grad_hopper": ((0.0, 0.0, 0.0), 10, [0.0, 0.0, 0.0, 0.0, 0.0, 200.0], True, 5, 0.7, None, 5e-5),
     }[model_name]
 
     pair = make_diff_scene_pair(
@@ -154,14 +151,14 @@ def test_rigid_per_step_force_grad_matches_fd(model_name, request, precision, sh
         lambda e, x: e.control_dofs_force(x),
         loss_fn,
         setup_fn=setup_fn,
-        rtol=5e-5 if precision == "64" else fp32_tol,
-        atol=5e-5 if precision == "64" else fp32_tol,
+        rtol=1e-10 if precision == "64" else fp32_tol,
+        atol=1e-10 if precision == "64" else fp32_tol,
         eps=3e-2,
     )
 
 
 @pytest.mark.required
-def test_rigid_frictionloss_grad_matches_fd(grad_revolute_frictionloss, precision, show_viewer):
+def test_frictionloss_grad_matches_fd(grad_revolute_frictionloss, precision, show_viewer):
     pair = make_diff_scene_pair(
         grad_revolute_frictionloss,
         substeps=4,
@@ -198,7 +195,7 @@ def test_rigid_frictionloss_grad_matches_fd(grad_revolute_frictionloss, precisio
         ("grad_weld_pair", 6),
     ],
 )
-def test_rigid_equality_grad_matches_fd(model_name, n_rows, request, precision, show_viewer):
+def test_equality_grad_matches_fd(model_name, n_rows, request, precision, show_viewer):
     pair = make_diff_scene_pair(
         request.getfixturevalue(model_name),
         substeps=4,
@@ -213,23 +210,24 @@ def test_rigid_equality_grad_matches_fd(model_name, n_rows, request, precision, 
     cs = pair.scene_fd.rigid_solver.constraint_solver.constraint_state
     assert qd_to_torch(cs.n_constraints_equality)[0] == n_rows
 
+    # Large initial velocities: the anchor velocity-product bias entering aref is quadratic in velocity, so its
+    # adjoint contribution only clears the fp64 tolerance band when the joints spin fast.
     assert_grad_matches_fd(
         pair,
-        [np.array([0.8, -0.3])],
+        [np.array([4.0, -2.5])],
         lambda e, x: e.set_dofs_velocity(x),
         lambda scene, entity: (
             scene.rigid_solver.get_state().qpos[0, 0] ** 2 + 0.7 * scene.rigid_solver.get_state().qpos[0, 1] ** 2
         ),
         n_steps=10,
-        rtol=2e-9 if precision == "64" else 5e-5,
-        atol=2e-9 if precision == "64" else 5e-5,
+        rtol=1e-10 if precision == "64" else 5e-5,
+        atol=1e-10 if precision == "64" else 5e-5,
         eps=1e-3 if precision == "64" else 3e-2,
     )
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_rigid_all_constraints_grad_matches_fd(grad_all_eq_fric, precision, show_viewer):
+def test_all_constraint_groups_grad_matches_fd(grad_all_eq_fric, precision, show_viewer):
     # Integration scene: frictionloss + equality joint + connect + weld on disjoint link pairs. Guards row-offset
     # bookkeeping across every differentiated constraint group at once; per-group formulas are pinned elsewhere.
     pair = make_diff_scene_pair(
@@ -259,7 +257,7 @@ def test_rigid_all_constraints_grad_matches_fd(grad_all_eq_fric, precision, show
         lambda e, x: e.set_dofs_velocity(x),
         loss_fn,
         n_steps=10,
-        rtol=5e-10 if precision == "64" else 5e-5,
-        atol=5e-10 if precision == "64" else 5e-5,
+        rtol=1e-10 if precision == "64" else 5e-5,
+        atol=1e-10 if precision == "64" else 5e-5,
         eps=3e-4 if precision == "64" else 3e-3,
     )
