@@ -501,23 +501,58 @@ def usd_scene(request, model_name, scale, fixed):
 
 @pytest.fixture(scope="session")
 def emissive_material_variants_glb(asset_tmp_path):
-    """Path to a GLB with three materials, each on distinct base/emissive texCoord sets: a base-color atlas (red) on
-    texCoord 0 with an emissive atlas on texCoord 1, a flat base color with an emissive atlas on texCoord 1, and a
-    KHR_materials_unlit material whose red base atlas stands in for the unlit imagery. The red base atlas is index 0."""
+    """Path to a GLB with three materials on distinct base/emissive texCoord sets and a triangle carrying two of them.
+
+    The materials are a base-color atlas (red) on texCoord 0 with an emissive atlas on texCoord 1, a flat base color
+    with an emissive atlas on texCoord 1, and a KHR_materials_unlit material whose red base atlas stands in for the
+    unlit imagery. The red base atlas is index 0. The triangle holds the first two materials as primitives, with the
+    same texture coordinates stored as float in set 0 and as normalized UNSIGNED_SHORT, an encoding core glTF allows,
+    in set 1."""
     images = []
     for color in (np.array([220, 30, 30], np.uint8), np.array([30, 220, 30], np.uint8)):
         buffer = io.BytesIO()
         Image.fromarray(np.broadcast_to(color, (8, 8, 3)).copy()).save(buffer, format="PNG")
         images.append(buffer.getvalue())
 
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    uvs = np.array([[0.125, 0.25], [0.375, 0.5], [0.625, 0.75]], dtype=np.float32)
+    uvs_uint16 = np.round(uvs * np.iinfo(np.uint16).max).astype(np.uint16)
+
     blob = b""
     buffer_views = []
-    for data in images:
+    for data in (*images, positions.tobytes(), uvs.tobytes(), uvs_uint16.tobytes()):
         blob += b"\x00" * ((4 - len(blob) % 4) % 4)
         buffer_views.append(pygltflib.BufferView(buffer=0, byteOffset=len(blob), byteLength=len(data)))
         blob += data
 
     gltf = pygltflib.GLTF2(
+        scene=0,
+        scenes=[pygltflib.Scene(nodes=[0])],
+        nodes=[pygltflib.Node(mesh=0)],
+        meshes=[
+            pygltflib.Mesh(
+                primitives=[
+                    pygltflib.Primitive(
+                        attributes=pygltflib.Attributes(POSITION=0, TEXCOORD_0=1, TEXCOORD_1=2), material=material
+                    )
+                    for material in range(2)
+                ]
+            )
+        ],
+        accessors=[
+            pygltflib.Accessor(
+                bufferView=2,
+                componentType=pygltflib.FLOAT,
+                count=3,
+                type="VEC3",
+                min=positions.min(axis=0).tolist(),
+                max=positions.max(axis=0).tolist(),
+            ),
+            pygltflib.Accessor(bufferView=3, componentType=pygltflib.FLOAT, count=3, type="VEC2"),
+            pygltflib.Accessor(
+                bufferView=4, componentType=pygltflib.UNSIGNED_SHORT, normalized=True, count=3, type="VEC2"
+            ),
+        ],
         materials=[
             pygltflib.Material(
                 pbrMetallicRoughness=pygltflib.PbrMetallicRoughness(

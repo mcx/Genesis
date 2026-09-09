@@ -341,6 +341,23 @@ def test_glb_draco_missing_normals_texcoord(glb_file):
         assert faces.shape[1] == 3, "Faces should be triangles"
 
 
+@pytest.mark.required
+def test_glb_texcoord(emissive_material_variants_glb):
+    # Material 0 reads the float set 0 and material 1 the normalized set 1, so both meshes carry the authored UVs
+    gs_meshes = gltf_utils.parse_mesh_glb(
+        emissive_material_variants_glb,
+        group_by_material=True,
+        scale=None,
+        is_mesh_zup=True,
+        surface=gs.surfaces.Default(),
+    )
+    assert len(gs_meshes) == 2
+    # V is flipped to the image-space convention
+    expected_uvs = np.array([[0.125, 0.75], [0.375, 0.5], [0.625, 0.25]], dtype=np.float32)
+    for gs_mesh in gs_meshes:
+        assert_allclose(gs_mesh.trimesh.visual.uv, expected_uvs, tol=1.0 / np.iinfo(np.uint16).max)
+
+
 # ==================== Material/Texture Parsing Tests ====================
 
 
