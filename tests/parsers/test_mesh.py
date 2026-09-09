@@ -18,12 +18,9 @@ import genesis.utils.mesh as mu
 from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 from .conftest import (
-    check_gs_meshes,
-    check_gs_surfaces,
     check_gs_textures,
     check_gs_tm_meshes,
     check_gs_tm_textures,
-    extract_mesh,
 )
 
 
@@ -290,19 +287,31 @@ def test_urdf_mesh_processing(mesh_path, mesh_urdf, show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("precision", ["32"])
-@pytest.mark.parametrize("glb_file", ["glb/combined_srt.glb", "glb/combined_transform.glb"])
-def test_glb_parse_geometry(glb_file, tol):
-    asset_path = get_hf_dataset(pattern=glb_file)
-    glb_file = os.path.join(asset_path, glb_file)
+@pytest.mark.parametrize(
+    "glb_file",
+    [
+        "glb/combined_srt.glb",
+        "glb/combined_transform.glb",
+        "normal_accessor_zero_glb",
+        "texcoord_0_accessor_zero_glb",
+        "texcoord_1_accessor_zero_glb",
+    ],
+)
+def test_glb_parse_geometry(request, glb_file, tol):
+    # An asset-relative path resolves through the dataset. A bare name is the fixture generating the file.
+    if "/" in glb_file:
+        glb_path = os.path.join(get_hf_dataset(pattern=glb_file), glb_file)
+    else:
+        glb_path = request.getfixturevalue(glb_file)
     gs_meshes = gltf_utils.parse_mesh_glb(
-        glb_file,
+        glb_path,
         group_by_material=False,
         scale=None,
         is_mesh_zup=True,
         surface=gs.surfaces.Default(),
     )
 
-    tm_scene = trimesh.load(glb_file, process=False)
+    tm_scene = trimesh.load(glb_path, process=False)
     tm_meshes = {}
     for node_name in tm_scene.graph.nodes_geometry:
         transform, geometry_name = tm_scene.graph[node_name]
