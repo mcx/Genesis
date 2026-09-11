@@ -991,19 +991,9 @@ def _add_collision_constraints_per_contact(
             if qd.static(rigid_config.enable_rolling_friction):
                 contact_data_friction_rolling = collider_state.contact_data.friction_rolling[i_col, i_b]
 
+            n_con_head = collision_con_start + i_col_ * rows_per_contact
             for i_friction in range(rows_per_contact):
-                n, n_ang = _func_contact_row_direction(
-                    i_friction,
-                    contact_data_normal,
-                    d1,
-                    d2,
-                    contact_data_friction,
-                    contact_data_friction_torsional,
-                    contact_data_friction_rolling,
-                    rigid_config,
-                )
-
-                n_con = collision_con_start + i_col_ * rows_per_contact + i_friction
+                n_con = n_con_head + i_friction
                 if qd.static(rigid_config.sparse_solve):
                     for i_d_ in range(constraint_state.jac_n_dofs[n_con, i_b]):
                         i_d = constraint_state.jac_dofs_idx[n_con, i_d_, i_b]
@@ -1011,51 +1001,67 @@ def _add_collision_constraints_per_contact(
                 else:
                     for i_d in range(n_dofs):
                         constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
-
-                same_root = (
-                    link_b > -1
-                    and dyn_info.links.root_idx[link_a_maybe_batch] == dyn_info.links.root_idx[link_b_maybe_batch]
-                )
-                con_n_dofs = 0
-                jac_qvel = gs.qd_float(0.0)
-                for i_ab in range(2):
-                    sign = gs.qd_float(-1.0)
-                    link = link_a
-                    if i_ab == 1:
-                        sign = gs.qd_float(1.0)
-                        link = link_b
-
-                    while link > -1:
-                        link_maybe_batch = [link, i_b] if qd.static(rigid_config.batch_links_info) else link
-
-                        # reverse order to make sure dofs in each row of self.jac_dofs_idx are strictly descending
-                        for i_d_ in range(dyn_info.links.n_dofs[link_maybe_batch]):
-                            i_d = dyn_info.links.dof_end[link_maybe_batch] - 1 - i_d_
-
-                            cdof_ang = dyn_state.dofs.cdof_ang[i_d, i_b]
-                            cdot_vel = dyn_state.dofs.cdof_vel[i_d, i_b]
-
-                            t_quat = gu.qd_identity_quat()
-                            t_pos = contact_data_pos - dyn_state.links.root_COM[link, i_b]
-                            _, vel = gu.qd_transform_motion_by_trans_quat(cdof_ang, cdot_vel, t_pos, t_quat)
-
-                            diff = sign * vel
+            # The rows of a contact share the point whose velocity each dof moves, so both kinematic chains are walked
+            # once: every dof's contribution to the point velocity is projected on each row's direction in turn, and
+            # the support built on the head row is copied to the others.
+            same_root = (
+                link_b > -1
+                and dyn_info.links.root_idx[link_a_maybe_batch] == dyn_info.links.root_idx[link_b_maybe_batch]
+            )
+            con_n_dofs = 0
+            for i_ab in range(2):
+                sign = gs.qd_float(-1.0)
+                link = link_a
+                if i_ab == 1:
+                    sign = gs.qd_float(1.0)
+                    link = link_b
+                while link > -1:
+                    link_maybe_batch = [link, i_b] if qd.static(rigid_config.batch_links_info) else link
+                    # reverse order to make sure dofs in each row of self.jac_dofs_idx are strictly descending
+                    for i_d_ in range(dyn_info.links.n_dofs[link_maybe_batch]):
+                        i_d = dyn_info.links.dof_end[link_maybe_batch] - 1 - i_d_
+                        cdof_ang = dyn_state.dofs.cdof_ang[i_d, i_b]
+                        cdot_vel = dyn_state.dofs.cdof_vel[i_d, i_b]
+                        t_quat = gu.qd_identity_quat()
+                        t_pos = contact_data_pos - dyn_state.links.root_COM[link, i_b]
+                        _, vel = gu.qd_transform_motion_by_trans_quat(cdof_ang, cdot_vel, t_pos, t_quat)
+                        diff = sign * vel
+                        for i_friction in range(rows_per_contact):
+                            n, n_ang = _func_contact_row_direction(
+                                i_friction,
+                                contact_data_normal,
+                                d1,
+                                d2,
+                                contact_data_friction,
+                                contact_data_friction_torsional,
+                                contact_data_friction_rolling,
+                                rigid_config,
+                            )
+                            n_con = n_con_head + i_friction
                             jac = diff @ n
                             if qd.static(rigid_config.enable_torsional_friction):
                                 # Unconditional fma on zero n_ang rows: see _add_friction_constraint.
                                 jac = jac + (sign * cdof_ang) @ n_ang
-                            jac_qvel = jac_qvel + jac * dyn_state.dofs.vel[i_d, i_b]
                             constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
-
-                            con_n_dofs = _append_relevant_dof(
-                                n_con, i_d, i_b, con_n_dofs, i_ab == 1 and same_root, constraint_state
-                            )
-
-                        link = dyn_info.links.parent_idx[link_maybe_batch]
-
+                        con_n_dofs = _append_relevant_dof(
+                            n_con_head, i_d, i_b, con_n_dofs, i_ab == 1 and same_root, constraint_state
+                        )
+                    link = dyn_info.links.parent_idx[link_maybe_batch]
+            _sort_relevant_dofs_descending(n_con_head, i_b, con_n_dofs, constraint_state, rigid_config)
+            for i_friction in range(rows_per_contact):
+                n_con = n_con_head + i_friction
                 constraint_state.jac_n_dofs[n_con, i_b] = con_n_dofs
-                _sort_relevant_dofs_descending(n_con, i_b, con_n_dofs, constraint_state, rigid_config)
-
+                if i_friction > 0:
+                    for i_d_ in range(con_n_dofs):
+                        constraint_state.jac_dofs_idx[n_con, i_d_, i_b] = constraint_state.jac_dofs_idx[
+                            n_con_head, i_d_, i_b
+                        ]
+            for i_friction in range(rows_per_contact):
+                n_con = n_con_head + i_friction
+                jac_qvel = gs.qd_float(0.0)
+                for i_d_ in range(con_n_dofs):
+                    i_d = constraint_state.jac_dofs_idx[n_con_head, i_d_, i_b]
+                    jac_qvel = jac_qvel + constraint_state.jac[n_con, i_d, i_b] * dyn_state.dofs.vel[i_d, i_b]
                 diag = gs.qd_float(0.0)
                 aref = gs.qd_float(0.0)
                 if qd.static(rigid_config.enable_elliptic_friction):
@@ -1987,16 +1993,15 @@ def func_compute_island_envelope(
             if col_min < constraint_state.island.dof_env_start_local[dof_base + ld, i_b]:
                 constraint_state.island.dof_env_start_local[dof_base + ld, i_b] = col_min
 
-    # Mass coupling: the kinematic-tree mask is directional (descendant -> ancestor) plus full intra-link, so check
-    # both orientations. DOFs are ascending, so the first coupled lower column is the smallest.
+    # Mass coupling: the smallest dof the mass matrix couples to each dof is a property of the kinematic tree
+    # (dofs_mass_envelope_start), and it lies in the same island, so its local position bounds the envelope directly.
     for ld in range(n):
         i_dg = constraint_state.island.dof_id[dof_base + ld, i_b]
-        for ld2 in range(ld):
-            j_dg = constraint_state.island.dof_id[dof_base + ld2, i_b]
-            if rigid_info.mass_parent_mask[i_dg, j_dg] > 0.5 or rigid_info.mass_parent_mask[j_dg, i_dg] > 0.5:
-                if ld2 < constraint_state.island.dof_env_start_local[dof_base + ld, i_b]:
-                    constraint_state.island.dof_env_start_local[dof_base + ld, i_b] = ld2
-                break
+        j_dg = rigid_info.dofs_mass_envelope_start[i_dg]
+        if j_dg < i_dg:
+            ld2 = constraint_state.island.dof_local_pos[j_dg, i_b]
+            if ld2 < constraint_state.island.dof_env_start_local[dof_base + ld, i_b]:
+                constraint_state.island.dof_env_start_local[dof_base + ld, i_b] = ld2
 
     # Transpose the envelope into per-column heights: col_end[c] = max row whose envelope reaches column c. The
     # column-oriented sweeps (rank-1 update, direct factor, backward substitution) iterate rows (c, col_end[c]]
@@ -2313,15 +2318,32 @@ def func_hessian_direct_batch(
         for j_d in range(j_lo, i_d + 1):
             j_dg = constraint_state.island.dof_id[dof_base + j_d, i_b]
             constraint_state.nt_H[i_b, i_dg, j_dg] = gs.qd_float(0.0)
-    # H += J.T @ D @ J by scattering each island constraint's rank update over the DOF pairs in its support
-    # (jac_dofs_idx), the triangle oriented by island-local position: the fill-reducing dof_id of the CPU skyline path
-    # is not globally monotonic, and every per-island factor/solve reads the block through the same orientation.
-    for i_lcon in range(con_n):
+    # H += J.T @ D @ J by blocks: the rows_per_contact consecutive rows sharing one support (a contact) scatter
+    # together, each pair of the support read and written once, oriented by island-local position like every
+    # per-island factor and solve read of the block (dof_id permutes the trees on the CPU skyline path).
+    n_rows = qd.static(rigid_config.rows_per_contact)
+    i_lcon = 0
+    while i_lcon < con_n:
         i_c = constraint_state.island.constraint_id[con_base + i_lcon, i_b]
-        # An inactive constraint contributes nothing to H; skip its whole scatter instead of multiplying by 0
-        if constraint_state.active[i_c, i_b]:
-            efc_D = constraint_state.efc_D[i_c, i_b]
-            jac_n = constraint_state.jac_n_dofs[i_c, i_b]
+        jac_n = constraint_state.jac_n_dofs[i_c, i_b]
+        n_block = 1
+        if i_lcon + n_rows <= con_n:
+            is_block = True
+            for i_r in qd.static(range(1, n_rows)):
+                i_cr = constraint_state.island.constraint_id[con_base + i_lcon + i_r, i_b]
+                if i_cr != i_c + i_r or constraint_state.jac_n_dofs[i_cr, i_b] != jac_n:
+                    is_block = False
+                else:
+                    for k in range(jac_n):
+                        if constraint_state.jac_dofs_idx[i_c, k, i_b] != constraint_state.jac_dofs_idx[i_cr, k, i_b]:
+                            is_block = False
+            if is_block:
+                n_block = n_rows
+        is_any_active = False
+        for i_r in range(n_block):
+            if constraint_state.active[i_c + i_r, i_b]:
+                is_any_active = True
+        if is_any_active:
             for i_d1_ in range(jac_n):
                 i_d1 = constraint_state.jac_dofs_idx[i_c, i_d1_, i_b]
                 for i_d2_ in range(i_d1_, jac_n):
@@ -2334,14 +2356,26 @@ def func_hessian_direct_batch(
                             >= constraint_state.island.dof_local_pos[i_d2, i_b]
                         ) != (i_d1 >= i_d2):
                             row, col = col, row
-                    contrib = constraint_state.jac[i_c, i_d1, i_b] * constraint_state.jac[i_c, i_d2, i_b] * efc_D
-                    # Each contribution carries its rows' scales so H assembles equilibrated; see nt_jacobi in
-                    # array_class.py.
-                    if qd.static(rigid_config.enable_jacobi_equilibration):
-                        contrib = (
-                            contrib * constraint_state.nt_jacobi[i_d1, i_b] * constraint_state.nt_jacobi[i_d2, i_b]
-                        )
-                    constraint_state.nt_H[i_b, row, col] = constraint_state.nt_H[i_b, row, col] + contrib
+                    h = constraint_state.nt_H[i_b, row, col]
+                    for i_r in range(n_block):
+                        i_cr = i_c + i_r
+                        if constraint_state.active[i_cr, i_b]:
+                            contrib = (
+                                constraint_state.jac[i_cr, i_d1, i_b]
+                                * constraint_state.jac[i_cr, i_d2, i_b]
+                                * constraint_state.efc_D[i_cr, i_b]
+                            )
+                            # Each contribution carries its rows' scales so H assembles equilibrated; see nt_jacobi in
+                            # array_class.py.
+                            if qd.static(rigid_config.enable_jacobi_equilibration):
+                                contrib = (
+                                    contrib
+                                    * constraint_state.nt_jacobi[i_d1, i_b]
+                                    * constraint_state.nt_jacobi[i_d2, i_b]
+                                )
+                            h = h + contrib
+                    constraint_state.nt_H[i_b, row, col] = h
+        i_lcon = i_lcon + n_block
     # H += M over the island's dofs, bounded by each dof's mass block (dofs_mass_block_start, mapped to local through
     # dof_local_pos): the mass couples no dofs across blocks, and a block lies within the envelope.
     for i_d in range(n):
@@ -4272,26 +4306,34 @@ def func_is_row_moving(i_c, i_b, constraint_state: array_class.ConstraintState, 
 
 
 @qd.func
-def func_is_dof_moving(i_d, i_b, constraint_state: array_class.ConstraintState, skip_settled_islands: qd.template()):
-    """Whether dof i_d belongs to an island still iterating, see func_is_row_moving."""
-    is_moving = True
-    if qd.static(skip_settled_islands):
-        if constraint_state.island.n_islands[i_b] > 1:
-            i_island = constraint_state.island.dofs_island_idx[i_d, i_b]
-            is_moving = constraint_state.island.improved[i_island, i_b] != 0
-    return is_moving
-
-
-@qd.func
 def func_qfrc_scatter_sparse(i_b, constraint_state: array_class.ConstraintState, skip_settled_islands: qd.template()):
-    """qfrc_constraint = J^T @ efc_force of one env by scattering each moving row over its sparse support
-    (jac_dofs_idx), the dofs of the moving islands cleared first (see func_is_row_moving)."""
+    """Accumulate qfrc_constraint = J^T @ efc_force of one env by scattering each row over its sparse support.
+
+    The dofs are cleared first. Under skip_settled_islands the rows and dofs are those of the islands still moving,
+    walked through the island lists (see func_update_constraint_batch).
+    """
     n_dofs = constraint_state.qfrc_constraint.shape[0]
-    for i_d in range(n_dofs):
-        if func_is_dof_moving(i_d, i_b, constraint_state, skip_settled_islands):
+    if qd.static(skip_settled_islands):
+        for i_island in range(constraint_state.island.n_islands[i_b]):
+            if constraint_state.island.improved[i_island, i_b]:
+                dof_lo = constraint_state.island.dof_slices.start[i_island, i_b]
+                dof_hi = dof_lo + constraint_state.island.dof_slices.n[i_island, i_b]
+                for i_pos in range(dof_lo, dof_hi):
+                    constraint_state.qfrc_constraint[constraint_state.island.dof_id[i_pos, i_b], i_b] = gs.qd_float(0.0)
+                row_lo = constraint_state.island.constraint_slices.start[i_island, i_b]
+                row_hi = row_lo + constraint_state.island.constraint_slices.n[i_island, i_b]
+                for i_pos in range(row_lo, row_hi):
+                    i_c = constraint_state.island.constraint_id[i_pos, i_b]
+                    for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+                        i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
+                        constraint_state.qfrc_constraint[i_d, i_b] = (
+                            constraint_state.qfrc_constraint[i_d, i_b]
+                            + constraint_state.jac[i_c, i_d, i_b] * constraint_state.efc_force[i_c, i_b]
+                        )
+    else:
+        for i_d in range(n_dofs):
             constraint_state.qfrc_constraint[i_d, i_b] = gs.qd_float(0.0)
-    for i_c in range(constraint_state.n_constraints[i_b]):
-        if func_is_row_moving(i_c, i_b, constraint_state, skip_settled_islands):
+        for i_c in range(constraint_state.n_constraints[i_b]):
             for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
                 i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
                 constraint_state.qfrc_constraint[i_d, i_b] = (
@@ -4326,16 +4368,15 @@ def func_update_constraint_batch(
 ):
     """Active flags, constraint forces, qfrc_constraint and cost of one env from its current Jaref.
 
-    Under skip_settled_islands the rows and dofs of an island that stands still (see improved in IslandState) keep
-    their values: its Jaref is frozen, so recomputing them gives the same result, and the iterations charge an env only
-    for the islands still moving. The seed leaves it False, the island labels being resolved after this pass there.
-    The cost then sums the visited rows and dofs, which the iterations read nowhere; only the seed compares costs."""
+    Under skip_settled_islands the pass walks the rows and dofs of the islands still moving through the island lists
+    (constraint_id, dof_id, see IslandState): an island that stands still (see improved in IslandState) keeps its
+    values, its Jaref being frozen, and its rows show no flip to the incremental factor, whose changed-row scan runs
+    per moving island. The seed leaves it False and walks every row and dof, the island labels being resolved after
+    this pass there. The cost then sums the visited rows and dofs, which the iterations read nowhere; only the seed
+    compares costs."""
     n_dofs = constraint_state.qfrc_constraint.shape[0]
-    ne = constraint_state.n_constraints_equality[i_b]
-    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
-    ncone = nef
-    if qd.static(rigid_config.enable_elliptic_friction):
-        ncone = ncone + constraint_state.n_constraints_cone[i_b]
+    n_con = constraint_state.n_constraints[i_b]
+    n_islands = constraint_state.island.n_islands[i_b]
 
     cost_i = gs.qd_float(0.0)
 
@@ -4345,50 +4386,30 @@ def func_update_constraint_batch(
     # factor's changed-constraint list. Pyramidal rows only write their own active, so they keep the fused inline
     # snapshot below.
     if qd.static(rigid_config.solver_type == gs.constraint_solver.Newton and rigid_config.enable_elliptic_friction):
-        for i_c in range(constraint_state.n_constraints[i_b]):
-            constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
+        if qd.static(skip_settled_islands):
+            for i_island in range(n_islands):
+                if constraint_state.island.improved[i_island, i_b]:
+                    row_lo = constraint_state.island.constraint_slices.start[i_island, i_b]
+                    row_hi = row_lo + constraint_state.island.constraint_slices.n[i_island, i_b]
+                    for i_pos in range(row_lo, row_hi):
+                        i_c = constraint_state.island.constraint_id[i_pos, i_b]
+                        constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
+        else:
+            for i_c in range(n_con):
+                constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
 
     # Beware 'active' does not refer to whether a constraint is active, but rather whether its quadratic cost is active
-    for i_c in range(constraint_state.n_constraints[i_b]):
-        is_cone_row = False
-        if qd.static(rigid_config.enable_elliptic_friction):
-            is_cone_row = nef <= i_c and i_c < ncone
-        if not func_is_row_moving(i_c, i_b, constraint_state, skip_settled_islands):
-            # A settled row keeps its values and shows no flip to the incremental factor, whose changed-row scan runs
-            # over the whole env.
-            if qd.static(
-                rigid_config.solver_type == gs.constraint_solver.Newton and not rigid_config.enable_elliptic_friction
-            ):
-                constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
-        elif is_cone_row:
-            # Elliptic cone contact: the coupled rows are resolved at the head row, which also writes the friction
-            # rows.
-            if (i_c - nef) % qd.static(rigid_config.rows_per_contact) == 0:
-                cost_i = cost_i + func_cone_update_rows(i_c, i_b, constraint_state, rigid_config)
-        else:
-            if qd.static(
-                rigid_config.solver_type == gs.constraint_solver.Newton and not rigid_config.enable_elliptic_friction
-            ):
-                constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
-            constraint_state.active[i_c, i_b] = True
-            floss_force = gs.qd_float(0.0)
-            if ne <= i_c and i_c < nef:  # Friction constraints
-                f = constraint_state.efc_frictionloss[i_c, i_b]
-                r = constraint_state.diag[i_c, i_b]
-                rf = r * f
-                linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
-                linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
-                constraint_state.active[i_c, i_b] = not (linear_neg or linear_pos)
-                floss_force = linear_neg * f + linear_pos * -f
-                floss_cost_local = linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b])
-                floss_cost_local = floss_cost_local + linear_pos * f * (-0.5 * rf + constraint_state.Jaref[i_c, i_b])
-                cost_i = cost_i + floss_cost_local
-            elif nef <= i_c:  # Contact / joint-limit constraints (unilateral)
-                constraint_state.active[i_c, i_b] = constraint_state.Jaref[i_c, i_b] < 0
-
-            constraint_state.efc_force[i_c, i_b] = floss_force + (
-                -constraint_state.Jaref[i_c, i_b] * constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
-            )
+    if qd.static(skip_settled_islands):
+        for i_island in range(n_islands):
+            if constraint_state.island.improved[i_island, i_b]:
+                row_lo = constraint_state.island.constraint_slices.start[i_island, i_b]
+                row_hi = row_lo + constraint_state.island.constraint_slices.n[i_island, i_b]
+                for i_pos in range(row_lo, row_hi):
+                    i_c = constraint_state.island.constraint_id[i_pos, i_b]
+                    cost_i = cost_i + _func_update_efc_force_body(i_c, i_b, constraint_state, rigid_config)
+    else:
+        for i_c in range(n_con):
+            cost_i = cost_i + _func_update_efc_force_body(i_c, i_b, constraint_state, rigid_config)
 
     # qfrc_constraint = J^T @ efc_force. The CPU skyline solve scatters each row over its sparse support, and so does an
     # env holding several islands, its cost following the islands' sizes, while one island spanning the env gathers
@@ -4401,19 +4422,32 @@ def func_update_constraint_batch(
     else:
         func_qfrc_scatter_sparse(i_b, constraint_state, skip_settled_islands)
 
-    # (Mx - Mx') * (x - x')
-    for i_d in range(n_dofs):
-        if func_is_dof_moving(i_d, i_b, constraint_state, skip_settled_islands):
-            v = (
-                0.5
-                * (Ma[i_d, i_b] - dyn_state.dofs.force[i_d, i_b])
-                * (qacc[i_d, i_b] - dyn_state.dofs.acc_smooth[i_d, i_b])
+    # (Mx - Mx') * (x - x') over the dofs, D * (Jx - aref) ** 2 over the rows
+    if qd.static(skip_settled_islands):
+        for i_island in range(n_islands):
+            if constraint_state.island.improved[i_island, i_b]:
+                dof_lo = constraint_state.island.dof_slices.start[i_island, i_b]
+                dof_hi = dof_lo + constraint_state.island.dof_slices.n[i_island, i_b]
+                for i_pos in range(dof_lo, dof_hi):
+                    i_d = constraint_state.island.dof_id[i_pos, i_b]
+                    cost_i = cost_i + 0.5 * (Ma[i_d, i_b] - dyn_state.dofs.force[i_d, i_b]) * (
+                        qacc[i_d, i_b] - dyn_state.dofs.acc_smooth[i_d, i_b]
+                    )
+                row_lo = constraint_state.island.constraint_slices.start[i_island, i_b]
+                row_hi = row_lo + constraint_state.island.constraint_slices.n[i_island, i_b]
+                for i_pos in range(row_lo, row_hi):
+                    i_c = constraint_state.island.constraint_id[i_pos, i_b]
+                    cost_i = cost_i + 0.5 * (
+                        constraint_state.Jaref[i_c, i_b] ** 2
+                        * constraint_state.efc_D[i_c, i_b]
+                        * constraint_state.active[i_c, i_b]
+                    )
+    else:
+        for i_d in range(n_dofs):
+            cost_i = cost_i + 0.5 * (Ma[i_d, i_b] - dyn_state.dofs.force[i_d, i_b]) * (
+                qacc[i_d, i_b] - dyn_state.dofs.acc_smooth[i_d, i_b]
             )
-            cost_i = cost_i + v
-
-    # D * (Jx - aref) ** 2
-    for i_c in range(constraint_state.n_constraints[i_b]):
-        if func_is_row_moving(i_c, i_b, constraint_state, skip_settled_islands):
+        for i_c in range(n_con):
             cost_i = cost_i + 0.5 * (
                 constraint_state.Jaref[i_c, i_b] ** 2
                 * constraint_state.efc_D[i_c, i_b]
@@ -4425,12 +4459,12 @@ def func_update_constraint_batch(
 
 @qd.func
 def _func_update_efc_force_body(i_c, i_b, constraint_state: array_class.ConstraintState, rigid_config: qd.template()):
-    """Compute active and write efc_force for one (constraint, env) pair.
+    """Update active and efc_force of one (constraint, env) pair from its Jaref and return the row's extra cost.
 
-    Same semantics as the per-constraint loop in ``func_update_constraint_batch`` (lines computing ``active``,
-    ``floss_force``, ``efc_force``). Friction cost contribution is *not* accumulated here; it's recomputed in
-    ``_func_update_cost_coop`` together with the quadratic term to avoid an extra atomic or shared-memory exchange
-    between kernels.
+    The extra cost is what the row adds beyond its quadratic term: the coupled cost of an elliptic cone resolved at its
+    head row, the friction-loss cost of a frictionloss row, zero otherwise. The cooperative path discards it and
+    recomputes the cost in _func_update_cost_coop together with the quadratic term, which spares the kernels an
+    exchange of cost terms.
     """
     ne = constraint_state.n_constraints_equality[i_b]
     nef = ne + constraint_state.n_constraints_frictionloss[i_b]
@@ -4438,12 +4472,12 @@ def _func_update_efc_force_body(i_c, i_b, constraint_state: array_class.Constrai
     if qd.static(rigid_config.enable_elliptic_friction):
         ncone = ncone + constraint_state.n_constraints_cone[i_b]
 
+    cost = gs.qd_float(0.0)
     if qd.static(rigid_config.enable_elliptic_friction) and (nef <= i_c and i_c < ncone):
-        # Elliptic cone contact (cooperative one-thread-per-row): only the head thread resolves the coupled rows
-        # and writes all of them; the friction-row threads are no-ops so each row is written exactly once
-        # (race-free). The coupled middle-zone cost is discarded here; _func_update_cost_coop recomputes it.
+        # Elliptic cone contact: the coupled rows are resolved at the head row, which also writes the friction rows, so
+        # each row is written exactly once whether the rows run on one thread or one thread each.
         if (i_c - nef) % qd.static(rigid_config.rows_per_contact) == 0:
-            func_cone_update_rows(i_c, i_b, constraint_state, rigid_config)
+            cost = func_cone_update_rows(i_c, i_b, constraint_state, rigid_config)
     else:
         if qd.static(
             rigid_config.solver_type == gs.constraint_solver.Newton and not rigid_config.enable_elliptic_friction
@@ -4459,12 +4493,15 @@ def _func_update_efc_force_body(i_c, i_b, constraint_state: array_class.Constrai
             linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
             constraint_state.active[i_c, i_b] = not (linear_neg or linear_pos)
             floss_force = linear_neg * f + linear_pos * -f
+            cost = linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b])
+            cost = cost + linear_pos * f * (-0.5 * rf + constraint_state.Jaref[i_c, i_b])
         elif nef <= i_c:
             constraint_state.active[i_c, i_b] = constraint_state.Jaref[i_c, i_b] < 0
 
         constraint_state.efc_force[i_c, i_b] = floss_force + (
             -constraint_state.Jaref[i_c, i_b] * constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
         )
+    return cost
 
 
 @qd.func
@@ -4636,29 +4673,24 @@ def func_update_gradient_batch(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
-    n_dofs = constraint_state.grad.shape[0]
-
     # The gradient of an island standing still is kept (see improved in IslandState), and a hibernated island carries
-    # a zero gradient and search direction, see func_island_tiled_factor_solve_all. An env holding one island that
-    # iterates moves as a whole and needs no lookup per dof.
-    if constraint_state.island.n_islands[i_b] == 1 and constraint_state.island.improved[0, i_b]:
-        for i_d in range(n_dofs):
-            constraint_state.grad[i_d, i_b] = (
-                constraint_state.Ma[i_d, i_b]
-                - dyn_state.dofs.force[i_d, i_b]
-                - constraint_state.qfrc_constraint[i_d, i_b]
-            )
-    else:
-        for i_d in range(n_dofs):
-            i_island = constraint_state.island.dofs_island_idx[i_d, i_b]
-            if constraint_state.island.improved[i_island, i_b]:
+    # a zero gradient and search direction, see func_island_tiled_factor_solve_all. Each island's dofs are walked
+    # through its dof list, so the pass costs the moving islands alone.
+    for i_island in range(constraint_state.island.n_islands[i_b]):
+        dof_lo = constraint_state.island.dof_slices.start[i_island, i_b]
+        dof_hi = dof_lo + constraint_state.island.dof_slices.n[i_island, i_b]
+        if constraint_state.island.improved[i_island, i_b]:
+            for i_pos in range(dof_lo, dof_hi):
+                i_d = constraint_state.island.dof_id[i_pos, i_b]
                 constraint_state.grad[i_d, i_b] = (
                     constraint_state.Ma[i_d, i_b]
                     - dyn_state.dofs.force[i_d, i_b]
                     - constraint_state.qfrc_constraint[i_d, i_b]
                 )
-            elif qd.static(rigid_config.use_hibernation):
-                if constraint_state.island.is_hibernated[i_island, i_b]:
+        elif qd.static(rigid_config.use_hibernation):
+            if constraint_state.island.is_hibernated[i_island, i_b]:
+                for i_pos in range(dof_lo, dof_hi):
+                    i_d = constraint_state.island.dof_id[i_pos, i_b]
                     constraint_state.grad[i_d, i_b] = gs.qd_float(0.0)
                     constraint_state.Mgrad[i_d, i_b] = gs.qd_float(0.0)
 
