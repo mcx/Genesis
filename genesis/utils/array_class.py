@@ -207,7 +207,6 @@ class ErrorCode(IntEnum):
     OVERFLOW_COLLISION_PAIRS = 0b00000000000000000000000000000001
     OVERFLOW_CANDIDATE_CONTACTS = 0b00000000000000000000000000000010
     OVERFLOW_CONTACTS = 0b00000000000000000000000000000100
-    OVERFLOW_HIBERNATION_ISLANDS = 0b00000000000000000000000000001000
     INVALID_CONTACT_NAN = 0b00000000000000000000000000010000
     INVALID_FORCE_NAN = 0b00000000000000000000000000100000
     INVALID_ACC_NAN = 0b00000000000000000000000001000000
@@ -221,12 +220,13 @@ class RigidInfo:
     kind: ClassVar[DataKind] = DataKind.CONSTANT
 
     # *_bw: Cache for backward pass
+    # Awake dofs per env under hibernation, counted down where an island sleeps and up where one wakes. An env whose
+    # count is zero has every body asleep and skips the passes that gate on it whole. An env whose count is the dof
+    # count has no sleeper and skips the passes that look for one (the chain edges and the wake pass of the island
+    # build, the pair filter of the broad phase, the contact advection, the inert rows), so hibernation costs it one
+    # read per pass until something sleeps in it. A dof-less scene pads its dof buffers to one slot and takes the slow
+    # path.
     n_awake_dofs: qd.Tensor = of_kind(DataKind.STATE)
-    awake_dofs: qd.Tensor = of_kind(DataKind.STATE)
-    n_awake_entities: qd.Tensor = of_kind(DataKind.STATE)
-    awake_entities: qd.Tensor = of_kind(DataKind.STATE)
-    n_awake_links: qd.Tensor = of_kind(DataKind.STATE)
-    awake_links: qd.Tensor = of_kind(DataKind.STATE)
     qpos0: qd.Tensor = of_kind(DataKind.INFO)
     qpos: qd.Tensor = of_kind(DataKind.STATE)
     qpos_next: qd.Tensor = of_kind(DataKind.SCRATCH)
@@ -321,11 +321,6 @@ def get_rigid_info(solver, kinematic_only):
             gravity=V_VEC(3, dtype=gs.qd_float, shape=()),
             meaninertia=V(dtype=gs.qd_float, shape=()),
             n_awake_dofs=V(dtype=gs.qd_int, shape=(_B,)),
-            n_awake_entities=V(dtype=gs.qd_int, shape=(_B,)),
-            n_awake_links=V(dtype=gs.qd_int, shape=(_B,)),
-            awake_dofs=V(dtype=gs.qd_int, shape=(solver.n_dofs_, _B)),
-            awake_entities=V(dtype=gs.qd_int, shape=(solver.n_entities_, _B)),
-            awake_links=V(dtype=gs.qd_int, shape=(solver.n_links_, _B)),
             qpos0=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
             qpos=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
             qpos_next=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
@@ -369,11 +364,6 @@ def get_rigid_info(solver, kinematic_only):
         gravity=V_VEC(3, dtype=gs.qd_float, shape=(_B,)),
         meaninertia=V(dtype=gs.qd_float, shape=(_B,)),
         n_awake_dofs=V(dtype=gs.qd_int, shape=(_B,)),
-        n_awake_entities=V(dtype=gs.qd_int, shape=(_B,)),
-        n_awake_links=V(dtype=gs.qd_int, shape=(_B,)),
-        awake_dofs=V(dtype=gs.qd_int, shape=(solver.n_dofs_, _B)),
-        awake_entities=V(dtype=gs.qd_int, shape=(solver.n_entities_, _B)),
-        awake_links=V(dtype=gs.qd_int, shape=(solver.n_links_, _B)),
         qpos0=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
         qpos=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B), needs_grad=requires_grad),
         qpos_next=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B), needs_grad=requires_grad),
@@ -446,9 +436,9 @@ class IslandState:
     # Partition of the dof-carrying kinematic trees (see trees_root_idx in RigidInfo) into islands, the connected
     # components of the trees under the contact, equality and hibernation couplings, rebuilt every step by island.py.
     # trees_parent_idx is the union-find forest over the trees, trees_island_idx the island of each tree and
-    # links_island_idx that of each link, -1 for a dof-less tree and its links. link_slices maps an island to its slice
-    # of link_id, dof_slices to its slice of dof_id (island-local dof -> global dof, ascending unless the CPU skyline
-    # path reorders it by contact adjacency).
+    # links_island_idx that of each link, -1 for a static link and for a dof-less tree and its links. link_slices maps
+    # an island to its slice of link_id, dof_slices to its slice of dof_id (island-local dof -> global dof, ascending
+    # unless the CPU skyline path reorders it by contact adjacency).
     trees_parent_idx: qd.Tensor
     trees_island_idx: qd.Tensor
     links_island_idx: qd.Tensor
@@ -2201,6 +2191,9 @@ class LinksState:
     cfrc_coupling_ang: qd.Tensor
     cfrc_coupling_vel: qd.Tensor
     contact_force: qd.Tensor
+    # Hibernation: is_hibernated flags a sleeping link, awake_steps counts the consecutive substeps an awake link has
+    # spent below the hibernation speed tolerance, up to hibernation_min_steps (see func_count_settled_step), zero
+    # again the step it exceeds the tolerance or wakes.
     is_hibernated: qd.Tensor = of_kind(DataKind.STATE)
     awake_steps: qd.Tensor = of_kind(DataKind.STATE)
 

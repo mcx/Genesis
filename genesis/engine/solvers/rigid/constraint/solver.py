@@ -11,7 +11,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd import func_solve_mass_batch
-from genesis.engine.solvers.rigid.abd.misc import linear_to_lower_tri
+from genesis.engine.solvers.rigid.abd.misc import func_hibernate_island_if_settled, linear_to_lower_tri
 from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tensor
 
 from .island import (
@@ -182,8 +182,10 @@ class ConstraintSolver:
 
         self.reset()
 
-        # The hibernated-island daisy chain must start empty (-1 = no successor); it persists across steps, written
-        # when an island hibernates and cleared on wakeup.
+        # A static link belongs to no tree, so the partition build labels it with no island (see func_build_islands):
+        # its slot of links_island_idx holds -1 for the life of the scene. The hibernated-island daisy chain must start
+        # empty (-1 = no successor); it persists across steps, written when an island hibernates and cleared on wakeup.
+        self.constraint_state.island.links_island_idx.fill(-1)
         if self._solver._use_hibernation:
             self.constraint_state.island.hibernated_next_link.fill(-1)
 
@@ -298,6 +300,7 @@ class ConstraintSolver:
             self._collider.collider_state,
             self.constraint_state,
             self._solver.dyn_info,
+            self._solver.rigid_info,
             self._solver.rigid_config,
         )
 
@@ -654,20 +657,25 @@ def _is_contact_inert(
     i_b,
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ) -> bool:
     """Whether a contact carries no constraint because neither endpoint is an awake dynamic body.
 
-    A sleeper struck by an awake body is revived before the constraints are assembled
-    (kernel_wake_up_entities_on_new_contact), so only hibernated-fixed pairs reach this state.
+    A sleeper struck by an awake body is revived as the island partition is built, before the constraints are
+    assembled (see func_build_islands), so only hibernated-fixed pairs reach this state.
     """
-    link_a_maybe_batch = [link_a, i_b] if qd.static(rigid_config.batch_links_info) else link_a
-    link_b_maybe_batch = [link_b, i_b] if qd.static(rigid_config.batch_links_info) else link_b
-    is_a_awake = not (dyn_info.links.is_fixed[link_a_maybe_batch] or dyn_state.links.is_hibernated[link_a, i_b])
-    is_b_awake = link_b >= 0 and not (
-        dyn_info.links.is_fixed[link_b_maybe_batch] or dyn_state.links.is_hibernated[link_b, i_b]
-    )
-    return not is_a_awake and not is_b_awake
+    is_inert = False
+    # A pair of fixed links is dropped at build time, so an env with no sleeper holds no inert contact
+    if rigid_info.n_awake_dofs[i_b] < dyn_state.dofs.is_hibernated.shape[0]:
+        link_a_maybe_batch = [link_a, i_b] if qd.static(rigid_config.batch_links_info) else link_a
+        link_b_maybe_batch = [link_b, i_b] if qd.static(rigid_config.batch_links_info) else link_b
+        is_a_awake = not (dyn_info.links.is_fixed[link_a_maybe_batch] or dyn_state.links.is_hibernated[link_a, i_b])
+        is_b_awake = link_b >= 0 and not (
+            dyn_info.links.is_fixed[link_b_maybe_batch] or dyn_state.links.is_hibernated[link_b, i_b]
+        )
+        is_inert = not is_a_awake and not is_b_awake
+    return is_inert
 
 
 @qd.func
@@ -907,7 +915,7 @@ def _add_collision_constraints_per_friction(
                 i_col = collider_state.contact_sort_idx[i_col_, i_b]
                 link_a = collider_state.contact_data.link_a[i_col, i_b]
                 link_b = collider_state.contact_data.link_b[i_col, i_b]
-                is_inert = _is_contact_inert(link_a, link_b, i_b, dyn_state, dyn_info, rigid_config)
+                is_inert = _is_contact_inert(link_a, link_b, i_b, dyn_state, dyn_info, rigid_info, rigid_config)
             if is_inert:
                 n_con = constraint_state.n_constraints[i_b] + i_col_ * rows_per_contact + i_friction
                 _clear_inert_collision_row(n_con, i_b, constraint_state, rigid_config)
@@ -966,7 +974,7 @@ def _add_collision_constraints_per_contact(
             link_b_maybe_batch = [link_b, i_b] if qd.static(rigid_config.batch_links_info) else link_b
 
             if qd.static(rigid_config.use_hibernation):
-                if _is_contact_inert(link_a, link_b, i_b, dyn_state, dyn_info, rigid_config):
+                if _is_contact_inert(link_a, link_b, i_b, dyn_state, dyn_info, rigid_info, rigid_config):
                     for i_friction in range(rows_per_contact):
                         n_con = collision_con_start + i_col_ * rows_per_contact + i_friction
                         _clear_inert_collision_row(n_con, i_b, constraint_state, rigid_config)
@@ -1436,19 +1444,16 @@ def _sort_contacts_and_build_islands(
     rigid_config: qd.template(),
     collider_static_config: qd.template(),
 ):
-    """Order the contacts of every env (see add_inequality_constraints) and build its island partition, the two per-env
-    steps sharing one launch.
+    """Order the contacts of every env (see add_inequality_constraints) and build its island partition in one launch.
 
     Where the cooperative kernels run, a block serves each env: the lanes sort together (func_sort_contacts_coop), then
-    build the partition together (func_build_islands_coop); elsewhere one thread per env does both. The order and the
-    partition are the same whichever way they are built, so the constraint order the caller assembles is too. A
-    single-island scene writes its partition outright (func_build_single_island), off the CPU skyline path and
-    hibernation, which alone read the tree and link labels the full build resolves.
+    build the partition together (func_build_islands_coop); elsewhere one thread per env does both. Both ways give the
+    same order and partition. A single-island scene writes its partition outright (func_build_single_island), off the
+    CPU skyline path and in every env where nothing sleeps.
     """
     _B = constraint_state.jac.shape[2]
-    has_trivial_partition = qd.static(
-        rigid_config.is_single_island and not rigid_config.sparse_solve and not rigid_config.use_hibernation
-    )
+    # Under hibernation the trivial partition serves the envs where nothing sleeps, the full build the others
+    has_trivial_partition = qd.static(rigid_config.is_single_island and not rigid_config.sparse_solve)
     if qd.static(rigid_config.enable_tiled_island_seed and not rigid_config.is_single_island):
         # Reset the per-class (env, island) work-list counters before the per-env builds append to them
         N_CLASSES = qd.static(
@@ -1466,7 +1471,16 @@ def _sort_contacts_and_build_islands(
                 func_sort_contacts_coop(i_b, tid, dyn_state, collider_state, constraint_state)
                 qd.simt.block.sync()
             if qd.static(has_trivial_partition):
-                func_build_single_island_coop(i_b, tid, constraint_state, rigid_info)
+                is_partition_trivial = True
+                if qd.static(rigid_config.use_hibernation):
+                    is_partition_trivial = rigid_info.n_awake_dofs[i_b] >= dyn_state.dofs.is_hibernated.shape[0]
+                if is_partition_trivial:
+                    func_build_single_island_coop(i_b, tid, constraint_state, rigid_info, rigid_config)
+                else:
+                    if qd.static(rigid_config.use_hibernation):
+                        func_build_islands_coop(
+                            i_b, tid, dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config
+                        )
             else:
                 func_build_islands_coop(
                     i_b, tid, dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config
@@ -1493,7 +1507,16 @@ def _sort_contacts_and_build_islands(
                     dyn_state.geoms.quat,
                 )
             if qd.static(has_trivial_partition):
-                func_build_single_island(i_b, constraint_state, rigid_info)
+                is_partition_trivial = True
+                if qd.static(rigid_config.use_hibernation):
+                    is_partition_trivial = rigid_info.n_awake_dofs[i_b] >= dyn_state.dofs.is_hibernated.shape[0]
+                if is_partition_trivial:
+                    func_build_single_island(i_b, constraint_state, rigid_info, rigid_config)
+                else:
+                    if qd.static(rigid_config.use_hibernation):
+                        func_build_islands(
+                            i_b, dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config
+                        )
             else:
                 func_build_islands(i_b, dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config)
             if qd.static(rigid_config.enable_tiled_island_seed and not rigid_config.is_single_island):
@@ -4650,7 +4673,7 @@ def func_update_constraint_batch(
         if is_moving:
             for i_pos in range(dof_lo, dof_hi):
                 i_d = linesearch.func_list_item(constraint_state.island.dof_id, i_pos, dof_lo, dof_base, i_b)
-                cost_i = cost_i + 0.5 * (Ma[i_d, i_b] - dyn_state.dofs.force[i_d, i_b]) * (
+                cost_i = cost_i + 0.5 * (Ma[i_d, i_b] - dyn_state.dofs.qf_smooth[i_d, i_b]) * (
                     qacc[i_d, i_b] - dyn_state.dofs.acc_smooth[i_d, i_b]
                 )
             for i_pos in range(row_lo, row_hi):
@@ -4810,7 +4833,7 @@ def _func_update_cost_coop(
         while i_d < n_dofs:
             v = (
                 0.5
-                * (Ma[i_d, i_b] - dyn_state.dofs.force[i_d, i_b])
+                * (Ma[i_d, i_b] - dyn_state.dofs.qf_smooth[i_d, i_b])
                 * (qacc[i_d, i_b] - dyn_state.dofs.acc_smooth[i_d, i_b])
             )
             cost_i = cost_i + v
@@ -4896,9 +4919,11 @@ def func_update_gradient_batch(
         if constraint_state.island.improved[i_island, i_b]:
             for i_pos in range(dof_lo, dof_hi):
                 i_d = linesearch.func_list_item(constraint_state.island.dof_id, i_pos, dof_lo, dof_base, i_b)
+                # dofs.force holds the smooth force only where the forward dynamics ran this step: a body woken at the
+                # island build (see func_build_islands) still carries the total force of its last solve there.
                 constraint_state.grad[i_d, i_b] = (
                     constraint_state.Ma[i_d, i_b]
-                    - dyn_state.dofs.force[i_d, i_b]
+                    - dyn_state.dofs.qf_smooth[i_d, i_b]
                     - constraint_state.qfrc_constraint[i_d, i_b]
                 )
     if qd.static(rigid_config.solver_type == gs.constraint_solver.CG):
@@ -4943,7 +4968,7 @@ def func_update_gradient_no_solve(
             if constraint_state.island.improved[i_island, i_b]:
                 constraint_state.grad[i_d, i_b] = (
                     constraint_state.Ma[i_d, i_b]
-                    - dyn_state.dofs.force[i_d, i_b]
+                    - dyn_state.dofs.qf_smooth[i_d, i_b]
                     - constraint_state.qfrc_constraint[i_d, i_b]
                 )
 
@@ -5402,6 +5427,7 @@ def func_update_contact_force(
     collider_state: array_class.ColliderState,
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
     n_links = dyn_state.links.contact_force.shape[0]
@@ -5452,7 +5478,9 @@ def func_update_contact_force(
             # An inert contact keeps the force of the last solve it took part in, so a resting sleeper keeps reporting
             # the support force it is at rest under.
             if qd.static(rigid_config.use_hibernation):
-                if _is_contact_inert(contact_data_link_a, contact_data_link_b, i_b, dyn_state, dyn_info, rigid_config):
+                if _is_contact_inert(
+                    contact_data_link_a, contact_data_link_b, i_b, dyn_state, dyn_info, rigid_info, rigid_config
+                ):
                     force = collider_state.contact_data.force[i_col, i_b]
             collider_state.contact_data.force[i_col, i_b] = force
 
@@ -5462,6 +5490,14 @@ def func_update_contact_force(
             dyn_state.links.contact_force[contact_data_link_b, i_b] = (
                 dyn_state.links.contact_force[contact_data_link_b, i_b] + force
             )
+
+        # The settled islands fall asleep here, once the solve has written the forces their contacts and dofs keep
+        # reporting for as long as they sleep, and before the integration skips their dofs.
+        if qd.static(rigid_config.use_hibernation):
+            for i_island in range(constraint_state.island.n_islands[i_b]):
+                func_hibernate_island_if_settled(
+                    i_island, i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config
+                )
 
 
 @qd.kernel(fastcache=True)
