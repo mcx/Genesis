@@ -1,3 +1,4 @@
+import copy
 import io
 import os
 import xml.etree.ElementTree as ET
@@ -499,8 +500,11 @@ def usd_scene(request, model_name, scale, fixed):
     return build_usd_scene(request.getfixturevalue(model_name), scale=scale, fixed=fixed)
 
 
-def _build_textured_triangle_glb(asset_tmp_path, name, first_attribute):
-    """Build a textured triangle with NORMAL or TEXCOORD_0 at accessor zero, returning the glTF document and path."""
+def _build_textured_triangle_glb(asset_tmp_path, name, first_attribute, primitive_mode=None, node_count=1):
+    """Build a textured triangle with NORMAL or TEXCOORD_0 at accessor zero, returning the glTF document and path.
+
+    The primitive is declared with primitive_mode when one is given, and node_count nodes hold it, each through a
+    mesh of its own."""
     mesh = trimesh.Trimesh(
         vertices=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         faces=[[0, 1, 2]],
@@ -525,6 +529,15 @@ def _build_textured_triangle_glb(asset_tmp_path, name, first_attribute):
     attributes.NORMAL = order.index(attributes.NORMAL)
     attributes.TEXCOORD_0 = order.index(attributes.TEXCOORD_0)
     primitive.indices = order.index(primitive.indices)
+    if primitive_mode is not None:
+        primitive.mode = primitive_mode
+    for i_node in range(1, node_count):
+        # The same primitive on a mesh and node of its own, ten units further along x
+        glb.meshes.append(pygltflib.Mesh(name=f"{glb.meshes[0].name}_{i_node}", primitives=[copy.deepcopy(primitive)]))
+        glb.nodes.append(
+            pygltflib.Node(mesh=i_node, name=f"{glb.nodes[0].name}_{i_node}", translation=[10.0 * i_node, 0.0, 0.0])
+        )
+        glb.scenes[0].nodes.append(i_node)
     return glb, path
 
 
@@ -639,6 +652,22 @@ def emissive_material_variants_glb(asset_tmp_path):
     path = asset_tmp_path / "emissive_material_variants.glb"
     gltf.save_binary(str(path))
     return str(path)
+
+
+@pytest.fixture(scope="session")
+def triangle_strip_nodes_glb(asset_tmp_path):
+    """Path to a GLB with two nodes holding TRIANGLE_STRIP primitives of the same material.
+
+    Sharing the material leaves the node each primitive comes from as the only thing separating the two meshes."""
+    glb, path = _build_textured_triangle_glb(
+        asset_tmp_path,
+        "triangle_strip_nodes",
+        first_attribute="NORMAL",
+        primitive_mode=pygltflib.TRIANGLE_STRIP,
+        node_count=2,
+    )
+    glb.save_binary(path)
+    return path
 
 
 @pytest.fixture

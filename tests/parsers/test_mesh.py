@@ -23,7 +23,6 @@ from .conftest import (
     check_gs_tm_textures,
 )
 
-
 # ==================== Scale Tests ====================
 
 
@@ -295,6 +294,7 @@ def test_urdf_mesh_processing(mesh_path, mesh_urdf, show_viewer):
         "normal_accessor_zero_glb",
         "texcoord_0_accessor_zero_glb",
         "texcoord_1_accessor_zero_glb",
+        "triangle_strip_nodes_glb",
     ],
 )
 def test_glb_parse_geometry(request, glb_file, tol):
