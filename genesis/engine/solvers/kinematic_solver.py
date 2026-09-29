@@ -1498,10 +1498,7 @@ class KinematicSolver(Solver):
         hold, and restores the one it does. Returns positions (n_envs, n_links, 3) and orientations
         (n_envs, n_links, 4), without the batch dimension when the scene is not batched.
         """
-        if self.n_envs == 0:
-            envs_idx = torch.zeros(1, dtype=gs.tc_int)
-        else:
-            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         qpos = broadcast_tensor(qpos, gs.tc_float, (len(envs_idx), entity.n_qs), ("envs_idx", "qs_idx")).contiguous()
 
         qs_idx = torch.arange(entity._q_start, entity._q_start + entity.n_qs, dtype=gs.tc_int, device=gs.device)
