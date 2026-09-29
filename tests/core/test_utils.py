@@ -16,12 +16,13 @@ from scipy.spatial.transform import Rotation as R, Slerp
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils import warnings as warnings_mod
+from genesis.utils.image_exporter import as_grayscale_image
 from genesis.utils.misc import tensor_to_array
 from genesis.utils.tools import FPSTracker
 from genesis.utils.urdf import compose_inertial_properties
 from genesis.utils.warnings import warn_once
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 from ..utils.collision import display_collision_pairs, get_genuine_interpenetration
 
@@ -922,6 +923,16 @@ def test_genuine_interpenetration(show_viewer):
 
     if show_viewer:
         display_collision_pairs(pairs_viz)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [None])
+def test_as_grayscale_image():
+    for batch_shape in ((), (2,)):
+        depth = np.broadcast_to(array=[[1.0, 3.0, 7.0]], shape=(*batch_shape, 1, 3))
+        for is_black_to_white, depth_expected in ((False, [[255, 127, 0]]), (True, [[0, 127, 255]])):
+            depth_image = as_grayscale_image(depth, enable_log_scale=True, black_to_white=is_black_to_white)
+            assert_equal(depth_image, depth_expected)
 
 
 @pytest.mark.required
